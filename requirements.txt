@@ -1,0 +1,26 @@
+# Core Framework
+fastapi[standard]>=0.115.0
+
+# HTTP Client
+httpx==0.28.1
+
+# Database
+sqlalchemy==2.0.44
+asyncpg==0.30.0
+alembic==1.14.0
+
+# Data Validation
+pydantic==2.12.3
+pydantic-settings==2.11.0
+
+# Authentication
+python-jose[cryptography]==3.3.0
+
+# Configuration
+python-dotenv==1.0.0
+
+# Logging
+structlog==25.1.0
+
+# Utilities
+python-multipart==0.0.20
