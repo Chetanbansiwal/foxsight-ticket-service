@@ -7,10 +7,16 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
+# Copy shared package wheel and install it first
+COPY shared/dist/*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/*.whl
+
+# Copy requirements and install Python dependencies
+COPY services/ticket-service/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy service code
+COPY services/ticket-service/ /app/
 
 EXPOSE 8000
 
