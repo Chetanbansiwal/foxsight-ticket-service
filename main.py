@@ -16,10 +16,7 @@ from sqlalchemy import select, and_, or_, update, func
 from sqlalchemy.orm import selectinload
 import structlog
 
-# Import shared modules
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '../../shared'))
-
+# Import shared modules - using installed vms-shared package
 from database import db_manager, get_db
 from models import (
     Ticket, TicketComment, TicketStateHistory,
