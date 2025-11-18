@@ -142,11 +142,19 @@ async def create_ticket(
         await db.refresh(ticket)
 
         # Create initial state history
+        # Get user ID from request headers (set by API Gateway) or use system user
+        user_id = request.headers.get('X-User-ID', '1')  # Default to system user
+        try:
+            user_id = int(user_id)
+        except (ValueError, TypeError):
+            user_id = 1
+
         state_history = TicketStateHistory(
             id=str(uuid.uuid4()),
             ticket_id=ticket.id,
-            old_status=None,
-            new_status="open",
+            from_status="",
+            to_status="open",
+            changed_by_user_id=user_id,
             changed_at=datetime.utcnow()
         )
         db.add(state_history)
@@ -320,8 +328,9 @@ async def get_ticket(
             "state_history": [
                 {
                     "id": h.id,
-                    "old_status": h.old_status,
-                    "new_status": h.new_status,
+                    "from_status": h.from_status,
+                    "to_status": h.to_status,
+                    "changed_by_user_id": h.changed_by_user_id,
                     "changed_at": h.changed_at.isoformat() if h.changed_at else None
                 }
                 for h in ticket.state_history
@@ -376,12 +385,20 @@ async def update_ticket_status(
         ticket.updated_at = datetime.utcnow()
 
         # Create state history
+        # Get user ID from request headers (set by API Gateway) or use system user
+        user_id = request.headers.get('X-User-ID', '1')
+        try:
+            user_id = int(user_id)
+        except (ValueError, TypeError):
+            user_id = 1
+
         import uuid
         state_history = TicketStateHistory(
             id=str(uuid.uuid4()),
             ticket_id=ticket.id,
-            old_status=old_status,
-            new_status=new_status,
+            from_status=old_status,
+            to_status=new_status,
+            changed_by_user_id=user_id,
             changed_at=datetime.utcnow()
         )
         db.add(state_history)
