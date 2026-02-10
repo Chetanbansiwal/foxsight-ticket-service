@@ -113,13 +113,14 @@ async def create_ticket(
             if field not in json_data:
                 raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
 
-        # Generate ticket number
-        ticket_number = f"TKT-{int(datetime.utcnow().timestamp())}"
+        # Generate unique ticket number (timestamp + random suffix for uniqueness)
+        import uuid
+        ticket_uuid = str(uuid.uuid4())
+        ticket_number = f"TKT-{int(datetime.utcnow().timestamp())}-{ticket_uuid[:8]}"
 
         # Create ticket
-        import uuid
         ticket = Ticket(
-            id=str(uuid.uuid4()),
+            id=ticket_uuid,
             ticket_number=ticket_number,
             title=json_data['title'],
             description=json_data.get('description'),
@@ -266,6 +267,62 @@ async def list_tickets(
     except Exception as e:
         logger.error("Failed to list tickets", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to list tickets")
+
+
+@app.get("/api/tickets/stats")
+async def get_ticket_stats(
+    db: AsyncSession = Depends(get_db),
+    organization_id: Optional[str] = Query(None)
+):
+    """Get ticket statistics"""
+    try:
+        filters = []
+        if organization_id:
+            filters.append(Ticket.organization_id == organization_id)
+
+        # Total tickets
+        total_query = select(func.count()).select_from(Ticket)
+        if filters:
+            total_query = total_query.where(and_(*filters))
+        total_result = await db.execute(total_query)
+        total = total_result.scalar()
+
+        # Count by status
+        status_counts = {}
+        for status in ['open', 'assigned', 'in_progress', 'resolved', 'closed', 'false_positive']:
+            query = select(func.count()).select_from(Ticket).where(Ticket.status == status)
+            if filters:
+                query = query.where(and_(*filters))
+            result = await db.execute(query)
+            status_counts[status] = result.scalar()
+
+        # Count by severity
+        severity_counts = {}
+        for severity in ['critical', 'high', 'medium', 'low', 'info']:
+            query = select(func.count()).select_from(Ticket).where(Ticket.severity == severity)
+            if filters:
+                query = query.where(and_(*filters))
+            result = await db.execute(query)
+            severity_counts[severity] = result.scalar()
+
+        # SLA breaches
+        sla_breach_query = select(func.count()).select_from(Ticket).where(Ticket.sla_breach == True)
+        if filters:
+            sla_breach_query = sla_breach_query.where(and_(*filters))
+        sla_breach_result = await db.execute(sla_breach_query)
+        sla_breaches = sla_breach_result.scalar()
+
+        return {
+            "total_tickets": total,
+            "by_status": status_counts,
+            "by_severity": severity_counts,
+            "sla_breaches": sla_breaches,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+    except Exception as e:
+        logger.error("Failed to get ticket stats", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to get ticket stats")
 
 
 @app.get("/api/tickets/{ticket_id}")
@@ -492,62 +549,6 @@ async def add_comment(
     except Exception as e:
         logger.error("Failed to add comment", ticket_id=ticket_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to add comment")
-
-
-@app.get("/api/tickets/stats")
-async def get_ticket_stats(
-    db: AsyncSession = Depends(get_db),
-    organization_id: Optional[str] = Query(None)
-):
-    """Get ticket statistics"""
-    try:
-        filters = []
-        if organization_id:
-            filters.append(Ticket.organization_id == organization_id)
-
-        # Total tickets
-        total_query = select(func.count()).select_from(Ticket)
-        if filters:
-            total_query = total_query.where(and_(*filters))
-        total_result = await db.execute(total_query)
-        total = total_result.scalar()
-
-        # Count by status
-        status_counts = {}
-        for status in ['open', 'assigned', 'in_progress', 'resolved', 'closed', 'false_positive']:
-            query = select(func.count()).select_from(Ticket).where(Ticket.status == status)
-            if filters:
-                query = query.where(and_(*filters))
-            result = await db.execute(query)
-            status_counts[status] = result.scalar()
-
-        # Count by severity
-        severity_counts = {}
-        for severity in ['critical', 'high', 'medium', 'low', 'info']:
-            query = select(func.count()).select_from(Ticket).where(Ticket.severity == severity)
-            if filters:
-                query = query.where(and_(*filters))
-            result = await db.execute(query)
-            severity_counts[severity] = result.scalar()
-
-        # SLA breaches
-        sla_breach_query = select(func.count()).select_from(Ticket).where(Ticket.sla_breach == True)
-        if filters:
-            sla_breach_query = sla_breach_query.where(and_(*filters))
-        sla_breach_result = await db.execute(sla_breach_query)
-        sla_breaches = sla_breach_result.scalar()
-
-        return {
-            "total_tickets": total,
-            "by_status": status_counts,
-            "by_severity": severity_counts,
-            "sla_breaches": sla_breaches,
-            "timestamp": datetime.utcnow().isoformat()
-        }
-
-    except Exception as e:
-        logger.error("Failed to get ticket stats", error=str(e))
-        raise HTTPException(status_code=500, detail="Failed to get ticket stats")
 
 
 if __name__ == "__main__":
