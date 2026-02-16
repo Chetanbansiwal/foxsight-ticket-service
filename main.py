@@ -9,6 +9,7 @@ import asyncio
 import os
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
+import time as _time
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -64,7 +65,7 @@ async def health_check():
         return {
             "service": "ticket-service",
             "status": "healthy",
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": _time.time()
         }
     except Exception as e:
         logger.error("Health check failed", error=str(e))
@@ -116,7 +117,7 @@ async def create_ticket(
         # Generate unique ticket number (timestamp + random suffix for uniqueness)
         import uuid
         ticket_uuid = str(uuid.uuid4())
-        ticket_number = f"TKT-{int(datetime.utcnow().timestamp())}-{ticket_uuid[:8]}"
+        ticket_number = f"TKT-{int(_time.time())}-{ticket_uuid[:8]}"
 
         # Create ticket
         ticket = Ticket(
@@ -134,8 +135,8 @@ async def create_ticket(
             thumbnail_url=json_data.get('thumbnail_url'),
             video_clip_url=json_data.get('video_clip_url'),
             detection_count=json_data.get('detection_count', 0),
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
+            created_at=_time.time(),
+            updated_at=_time.time()
         )
 
         db.add(ticket)
@@ -156,7 +157,7 @@ async def create_ticket(
             from_status="",
             to_status="open",
             changed_by_user_id=user_id,
-            changed_at=datetime.utcnow()
+            changed_at=_time.time()
         )
         db.add(state_history)
         await db.commit()
@@ -252,8 +253,8 @@ async def list_tickets(
                     "provider_id": t.provider_id,
                     "provider_name": t.provider.name if t.provider else None,
                     "assigned_to": t.assigned_to.username if t.assigned_to else None,
-                    "created_at": t.created_at.isoformat() if t.created_at else None,
-                    "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                    "created_at": t.created_at if t.created_at else None,
+                    "updated_at": t.updated_at if t.updated_at else None,
                     "thumbnail_url": t.thumbnail_url,
                     "sla_breach": t.sla_breach
                 }
@@ -317,7 +318,7 @@ async def get_ticket_stats(
             "by_status": status_counts,
             "by_severity": severity_counts,
             "sla_breaches": sla_breaches,
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": _time.time()
         }
 
     except Exception as e:
@@ -362,7 +363,7 @@ async def get_ticket(
             "provider_name": ticket.provider.name if ticket.provider else None,
             "vendor_alert_id": ticket.vendor_alert_id,
             "assigned_to": ticket.assigned_to.username if ticket.assigned_to else None,
-            "assigned_at": ticket.assigned_at.isoformat() if ticket.assigned_at else None,
+            "assigned_at": ticket.assigned_at if ticket.assigned_at else None,
             "alert_data": ticket.alert_data,
             "thumbnail_url": ticket.thumbnail_url,
             "video_clip_url": ticket.video_clip_url,
@@ -371,14 +372,14 @@ async def get_ticket(
             "sla_breach_reason": ticket.sla_breach_reason,
             "first_response_time_seconds": ticket.first_response_time_seconds,
             "resolution_time_seconds": ticket.resolution_time_seconds,
-            "created_at": ticket.created_at.isoformat() if ticket.created_at else None,
-            "updated_at": ticket.updated_at.isoformat() if ticket.updated_at else None,
+            "created_at": ticket.created_at if ticket.created_at else None,
+            "updated_at": ticket.updated_at if ticket.updated_at else None,
             "comments": [
                 {
                     "id": c.id,
                     "comment": c.comment,
                     "is_internal": c.is_internal,
-                    "created_at": c.created_at.isoformat() if c.created_at else None
+                    "created_at": c.created_at if c.created_at else None
                 }
                 for c in ticket.comments
             ],
@@ -388,7 +389,7 @@ async def get_ticket(
                     "from_status": h.from_status,
                     "to_status": h.to_status,
                     "changed_by_user_id": h.changed_by_user_id,
-                    "changed_at": h.changed_at.isoformat() if h.changed_at else None
+                    "changed_at": h.changed_at if h.changed_at else None
                 }
                 for h in ticket.state_history
             ]
@@ -439,7 +440,7 @@ async def update_ticket_status(
 
         # Update ticket
         ticket.status = new_status
-        ticket.updated_at = datetime.utcnow()
+        ticket.updated_at = _time.time()
 
         # Create state history
         # Get user ID from request headers (set by API Gateway) or use system user
@@ -456,7 +457,7 @@ async def update_ticket_status(
             from_status=old_status,
             to_status=new_status,
             changed_by_user_id=user_id,
-            changed_at=datetime.utcnow()
+            changed_at=_time.time()
         )
         db.add(state_history)
 
@@ -467,7 +468,7 @@ async def update_ticket_status(
                 ticket_id=ticket.id,
                 comment=json_data['comment'],
                 is_internal=json_data.get('is_internal', False),
-                created_at=datetime.utcnow()
+                created_at=_time.time()
             )
             db.add(comment)
 
@@ -527,7 +528,7 @@ async def add_comment(
             ticket_id=ticket_id,
             comment=json_data['comment'],
             is_internal=json_data.get('is_internal', False),
-            created_at=datetime.utcnow()
+            created_at=_time.time()
         )
 
         db.add(comment)
