@@ -1,0 +1,39 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    gcc \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy shared package wheel and install it first
+COPY shared/dist/*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/*.whl
+
+# Copy requirements and install Python dependencies
+COPY services/ticket-service/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy service code
+COPY services/ticket-service/ /app/
+
+
+    CMD curl -f http://localhost:8000/health || exit 1
+
+
+# === DEPLOYMENT HARDENING ===
+RUN addgroup --gid 1001 foxsight && \
+    adduser --uid 1001 --gid 1001 --disabled-password --gecos "" foxsight && \
+    chown -R foxsight:foxsight /app
+
+RUN rm -f /bin/sh /bin/bash /bin/dash /usr/bin/sh /usr/bin/bash /usr/bin/dash \
+          /usr/bin/apt /usr/bin/apt-get /usr/bin/dpkg \
+          /usr/bin/pip /usr/bin/pip3 /usr/local/bin/pip /usr/local/bin/pip3 \
+          /usr/bin/curl /usr/bin/wget && \
+    cp /bin/true /bin/sh 2>/dev/null || true
+
+USER foxsight
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
