@@ -24,6 +24,7 @@ from models import (
     NotificationLog, AnalyticsProvider, User, Camera,
     TicketStatus
 )
+from auth import get_current_user_flexible, get_user_from_headers
 
 # Configure logging
 logger = structlog.get_logger()
@@ -83,6 +84,7 @@ async def health_check():
 @app.post("/api/tickets")
 async def create_ticket(
     request: Request,
+    caller: Optional[User] = Depends(get_user_from_headers),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -144,12 +146,8 @@ async def create_ticket(
         await db.refresh(ticket)
 
         # Create initial state history
-        # Get user ID from request headers (set by API Gateway) or use system user
-        user_id = request.headers.get('X-User-ID', '1')  # Default to system user
-        try:
-            user_id = int(user_id)
-        except (ValueError, TypeError):
-            user_id = 1
+        # Use authenticated caller if available, otherwise default to system user
+        user_id = caller.id if caller else 1
 
         state_history = TicketStateHistory(
             id=str(uuid.uuid4()),
@@ -184,6 +182,7 @@ async def create_ticket(
 
 @app.get("/api/tickets")
 async def list_tickets(
+    current_user: User = Depends(get_current_user_flexible),
     db: AsyncSession = Depends(get_db),
     status: Optional[str] = Query(None, description="Filter by status"),
     severity: Optional[str] = Query(None, description="Filter by severity"),
@@ -272,6 +271,7 @@ async def list_tickets(
 
 @app.get("/api/tickets/stats")
 async def get_ticket_stats(
+    current_user: User = Depends(get_current_user_flexible),
     db: AsyncSession = Depends(get_db),
     organization_id: Optional[str] = Query(None)
 ):
@@ -329,6 +329,7 @@ async def get_ticket_stats(
 @app.get("/api/tickets/{ticket_id}")
 async def get_ticket(
     ticket_id: str,
+    current_user: User = Depends(get_current_user_flexible),
     db: AsyncSession = Depends(get_db)
 ):
     """Get ticket details including comments and history"""
@@ -406,6 +407,7 @@ async def get_ticket(
 async def update_ticket_status(
     ticket_id: str,
     request: Request,
+    current_user: User = Depends(get_current_user_flexible),
     db: AsyncSession = Depends(get_db)
 ):
     """
@@ -442,21 +444,13 @@ async def update_ticket_status(
         ticket.status = new_status
         ticket.updated_at = _time.time()
 
-        # Create state history
-        # Get user ID from request headers (set by API Gateway) or use system user
-        user_id = request.headers.get('X-User-ID', '1')
-        try:
-            user_id = int(user_id)
-        except (ValueError, TypeError):
-            user_id = 1
-
         import uuid
         state_history = TicketStateHistory(
             id=str(uuid.uuid4()),
             ticket_id=ticket.id,
             from_status=old_status,
             to_status=new_status,
-            changed_by_user_id=user_id,
+            changed_by_user_id=current_user.id,
             changed_at=_time.time()
         )
         db.add(state_history)
@@ -497,6 +491,7 @@ async def update_ticket_status(
 async def add_comment(
     ticket_id: str,
     request: Request,
+    current_user: User = Depends(get_current_user_flexible),
     db: AsyncSession = Depends(get_db)
 ):
     """
