@@ -25,6 +25,7 @@ from models import (
     TicketStatus
 )
 from auth import get_current_user_flexible, get_user_from_headers
+from zone_scoping import resolve_user_zone_ids, scope_by_camera_id
 
 # Configure logging
 logger = structlog.get_logger()
@@ -228,6 +229,13 @@ async def list_tickets(
         count_query = select(func.count()).select_from(Ticket)
         if filters:
             count_query = count_query.where(and_(*filters))
+
+        # Zone/Area scoping (WS-Z): restrict to tickets whose camera is in the
+        # caller's zones. Applied to BOTH query and count so totals stay consistent.
+        zone_ids = await resolve_user_zone_ids(current_user, db)
+        query = scope_by_camera_id(query, Ticket, zone_ids)
+        count_query = scope_by_camera_id(count_query, Ticket, zone_ids)
+
         total_result = await db.execute(count_query)
         total = total_result.scalar()
 
@@ -281,11 +289,17 @@ async def get_ticket_stats(
         if organization_id:
             filters.append(Ticket.organization_id == organization_id)
 
+        # Zone/Area scoping (WS-Z): every count below is restricted to the
+        # caller's zones so a scoped operator sees only their zones' totals.
+        zone_ids = await resolve_user_zone_ids(current_user, db)
+        def _scope(q):
+            return scope_by_camera_id(q, Ticket, zone_ids)
+
         # Total tickets
         total_query = select(func.count()).select_from(Ticket)
         if filters:
             total_query = total_query.where(and_(*filters))
-        total_result = await db.execute(total_query)
+        total_result = await db.execute(_scope(total_query))
         total = total_result.scalar()
 
         # Count by status
@@ -294,7 +308,7 @@ async def get_ticket_stats(
             query = select(func.count()).select_from(Ticket).where(Ticket.status == status)
             if filters:
                 query = query.where(and_(*filters))
-            result = await db.execute(query)
+            result = await db.execute(_scope(query))
             status_counts[status] = result.scalar()
 
         # Count by severity
@@ -303,14 +317,14 @@ async def get_ticket_stats(
             query = select(func.count()).select_from(Ticket).where(Ticket.severity == severity)
             if filters:
                 query = query.where(and_(*filters))
-            result = await db.execute(query)
+            result = await db.execute(_scope(query))
             severity_counts[severity] = result.scalar()
 
         # SLA breaches
         sla_breach_query = select(func.count()).select_from(Ticket).where(Ticket.sla_breach == True)
         if filters:
             sla_breach_query = sla_breach_query.where(and_(*filters))
-        sla_breach_result = await db.execute(sla_breach_query)
+        sla_breach_result = await db.execute(_scope(sla_breach_query))
         sla_breaches = sla_breach_result.scalar()
 
         return {
@@ -350,6 +364,13 @@ async def get_ticket(
 
         if not ticket:
             raise HTTPException(status_code=404, detail="Ticket not found")
+
+        # Zone/Area scoping (WS-Z): don't reveal tickets outside the caller's zones.
+        zone_ids = await resolve_user_zone_ids(current_user, db)
+        if zone_ids is not None:
+            cam_zone = ticket.camera.zone_id if ticket.camera else None
+            if cam_zone not in zone_ids:
+                raise HTTPException(status_code=404, detail="Ticket not found")
 
         return {
             "id": ticket.id,
