@@ -63,6 +63,27 @@ async def _ensure_alarm_schema():
         logger.warning("Alarm self-migration skipped/failed", error=str(e))
 
 
+async def _ensure_escalation_schema():
+    """WS1 self-migration — additive + idempotent. The escalation_* tables are
+    created by Base.metadata.create_all (new tables); this only adds the new
+    escalation columns to the existing tickets table + their index."""
+    try:
+        async with get_db_session() as s:
+            await s.execute(text("""
+                ALTER TABLE tickets
+                    ADD COLUMN IF NOT EXISTS escalation_policy_id VARCHAR(36),
+                    ADD COLUMN IF NOT EXISTS escalation_level     INTEGER DEFAULT 0,
+                    ADD COLUMN IF NOT EXISTS escalated_at         DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS next_escalation_at   DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS acknowledged_at      DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS acknowledged_by      INTEGER
+            """))
+            await s.execute(text("CREATE INDEX IF NOT EXISTS ix_tickets_next_escalation_at ON tickets(next_escalation_at)"))
+        logger.info("WS1 escalation schema ensured (self-migration)")
+    except Exception as e:
+        logger.warning("Escalation self-migration skipped/failed", error=str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -70,6 +91,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Ticket Service...")
     await db_manager.initialize()
     await _ensure_alarm_schema()
+    await _ensure_escalation_schema()
     logger.info("Ticket Service started successfully")
 
     yield
