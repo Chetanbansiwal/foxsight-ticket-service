@@ -13,14 +13,14 @@ import time as _time
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, update, func
+from sqlalchemy import select, and_, or_, update, func, text
 from sqlalchemy.orm import selectinload
 import structlog
 
 # Import shared modules - using installed vms-shared package
-from database import db_manager, get_db
+from database import db_manager, get_db, get_db_session
 from models import (
-    Ticket, TicketComment, TicketStateHistory,
+    Ticket, TicketComment, TicketStateHistory, AlarmEventLink,
     NotificationLog, AnalyticsProvider, User, Camera,
     TicketStatus
 )
@@ -30,12 +30,46 @@ from zone_scoping import resolve_user_zone_ids, scope_by_camera_id
 # Configure logging
 logger = structlog.get_logger()
 
+
+async def _ensure_alarm_schema():
+    """WS0 self-migration — additive + idempotent, safe every boot (mirrors
+    camera-management's _ensure_zone_schema). create_all makes the
+    alarm_event_link table, but NOT the new `tickets` columns nor the NOT NULL
+    relaxations on an already-existing install — so a fresh install or
+    `foxsight update` self-migrates regardless of the box's migrate script."""
+    try:
+        async with get_db_session() as s:
+            await s.execute(text("""
+                ALTER TABLE tickets
+                    ADD COLUMN IF NOT EXISTS alarm_type       VARCHAR(50),
+                    ADD COLUMN IF NOT EXISTS primary_event_id INTEGER,
+                    ADD COLUMN IF NOT EXISTS is_latched       BOOLEAN DEFAULT FALSE,
+                    ADD COLUMN IF NOT EXISTS latch_cleared_at DOUBLE PRECISION
+            """))
+            await s.execute(text("ALTER TABLE tickets ALTER COLUMN camera_id DROP NOT NULL"))
+            await s.execute(text("ALTER TABLE tickets ALTER COLUMN provider_id DROP NOT NULL"))
+            await s.execute(text("CREATE INDEX IF NOT EXISTS ix_tickets_alarm_type ON tickets(alarm_type)"))
+            await s.execute(text("CREATE INDEX IF NOT EXISTS ix_tickets_is_latched ON tickets(is_latched)"))
+            await s.execute(text("""
+                CREATE TABLE IF NOT EXISTS alarm_event_link (
+                    ticket_id  VARCHAR(36) NOT NULL REFERENCES tickets(id),
+                    event_id   INTEGER     NOT NULL REFERENCES events(id),
+                    created_at DOUBLE PRECISION NOT NULL,
+                    PRIMARY KEY (ticket_id, event_id)
+                )
+            """))
+        logger.info("WS0 alarm schema ensured (self-migration)")
+    except Exception as e:
+        logger.warning("Alarm self-migration skipped/failed", error=str(e))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     # Startup
     logger.info("Starting Ticket Service...")
     await db_manager.initialize()
+    await _ensure_alarm_schema()
     logger.info("Ticket Service started successfully")
 
     yield
@@ -111,8 +145,11 @@ async def create_ticket(
     try:
         json_data = await request.json()
 
-        # Validate required fields
-        required_fields = ['title', 'severity', 'camera_id', 'provider_id']
+        # Only title + severity are universally required. camera_id/provider_id
+        # are optional now so WS0 system alarms (camera offline, video-loss,
+        # storage-full) — which have no analytics provider, and for storage no
+        # camera — can create tickets. Analytics callers still send both.
+        required_fields = ['title', 'severity']
         for field in required_fields:
             if field not in json_data:
                 raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
@@ -123,6 +160,7 @@ async def create_ticket(
         ticket_number = f"TKT-{int(_time.time())}-{ticket_uuid[:8]}"
 
         # Create ticket
+        primary_event_id = json_data.get('primary_event_id')
         ticket = Ticket(
             id=ticket_uuid,
             ticket_number=ticket_number,
@@ -130,10 +168,13 @@ async def create_ticket(
             description=json_data.get('description'),
             severity=json_data['severity'],
             status="open",
-            camera_id=json_data['camera_id'],
+            camera_id=json_data.get('camera_id'),
             organization_id=json_data.get('organization_id'),
-            provider_id=json_data['provider_id'],
+            provider_id=json_data.get('provider_id'),
             vendor_alert_id=json_data.get('vendor_alert_id'),
+            alarm_type=json_data.get('alarm_type'),
+            primary_event_id=primary_event_id,
+            is_latched=bool(json_data.get('is_latched', False)),
             alert_data=json_data.get('alert_data'),
             thumbnail_url=json_data.get('thumbnail_url'),
             video_clip_url=json_data.get('video_clip_url'),
@@ -143,6 +184,10 @@ async def create_ticket(
         )
 
         db.add(ticket)
+        # Link the originating event (WS0).
+        if primary_event_id is not None:
+            db.add(AlarmEventLink(ticket_id=ticket_uuid, event_id=primary_event_id,
+                                  created_at=_time.time()))
         await db.commit()
         await db.refresh(ticket)
 
@@ -179,6 +224,112 @@ async def create_ticket(
     except Exception as e:
         logger.error("Failed to create ticket", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to create ticket")
+
+
+@app.post("/api/tickets/alarm")
+async def upsert_alarm(
+    request: Request,
+    caller: Optional[User] = Depends(get_user_from_headers),
+    db: AsyncSession = Depends(get_db)
+):
+    """Idempotent alarm intake (WS0). event-management calls this once per alarm
+    event. It dedups a state alarm into a SINGLE latched ticket per
+    (camera_id, alarm_type) and clears the latch when the condition ends —
+    keeping every contributing event linked in alarm_event_link.
+
+    Body:
+      alarm_type   str  (required)  e.g. "camera_offline"
+      event_id     int  (required)  the originating/contributing event
+      is_clear     bool             true = condition cleared (e.g. camera back online)
+      severity, title, description, camera_id, organization_id, alert_data
+      latch        bool  default true (state alarms latch; edge alarms may not)
+    """
+    import uuid
+    try:
+        data = await request.json()
+        alarm_type = data.get('alarm_type')
+        event_id = data.get('event_id')
+        if not alarm_type or event_id is None:
+            raise HTTPException(status_code=400, detail="alarm_type and event_id are required")
+        camera_id = data.get('camera_id')
+        is_clear = bool(data.get('is_clear', False))
+        now = _time.time()
+        actor = caller.id if caller else 1
+
+        # The active alarm ticket for this (camera, alarm_type) = one not yet
+        # resolved/closed. NULL camera (e.g. storage-full) matches NULL.
+        active = ("open", "assigned", "in_progress")
+        q = select(Ticket).where(Ticket.alarm_type == alarm_type, Ticket.status.in_(active))
+        q = q.where(Ticket.camera_id == camera_id) if camera_id is not None else q.where(Ticket.camera_id.is_(None))
+        existing = (await db.execute(q.order_by(Ticket.created_at.desc()))).scalars().first()
+
+        async def _link(tid):
+            dup = (await db.execute(select(AlarmEventLink).where(
+                AlarmEventLink.ticket_id == tid, AlarmEventLink.event_id == event_id))).scalars().first()
+            if not dup:
+                db.add(AlarmEventLink(ticket_id=tid, event_id=event_id, created_at=now))
+
+        if is_clear:
+            if not existing:
+                return {"message": "no active alarm to clear", "created": False}
+            await _link(existing.id)
+            existing.latch_cleared_at = now
+            existing.updated_at = now
+            # If someone already responded, the alarm is fully done once the
+            # condition also clears → auto-resolve.
+            if existing.first_response_at:
+                existing.status = "resolved"
+                existing.resolved_at = now
+                db.add(TicketStateHistory(id=str(uuid.uuid4()), ticket_id=existing.id,
+                    from_status="", to_status="resolved", changed_by_user_id=actor,
+                    reason="Auto-resolved: alarm condition cleared after acknowledgement",
+                    changed_at=now))
+            await db.commit()
+            return {"message": "latch cleared", "ticket_id": existing.id,
+                    "status": existing.status, "created": False}
+
+        # Raising event.
+        if existing:
+            # Same active alarm re-fired → dedup into the one ticket.
+            await _link(existing.id)
+            existing.detection_count = (existing.detection_count or 0) + 1
+            existing.updated_at = now
+            await db.commit()
+            return {"message": "deduped into existing alarm", "ticket_id": existing.id,
+                    "status": existing.status, "created": False}
+
+        # New alarm → latched ticket.
+        tid = str(uuid.uuid4())
+        tnum = f"TKT-{int(now)}-{tid[:8]}"
+        ticket = Ticket(
+            id=tid, ticket_number=tnum,
+            title=data.get('title') or alarm_type.replace("_", " ").title(),
+            description=data.get('description'),
+            severity=data.get('severity', 'high'),
+            status="open",
+            camera_id=camera_id,
+            organization_id=data.get('organization_id'),
+            alarm_type=alarm_type,
+            primary_event_id=event_id,
+            is_latched=bool(data.get('latch', True)),
+            alert_data=data.get('alert_data'),
+            detection_count=1,
+            created_at=now, updated_at=now,
+        )
+        db.add(ticket)
+        await _link(tid)
+        db.add(TicketStateHistory(id=str(uuid.uuid4()), ticket_id=tid,
+            from_status="", to_status="open", changed_by_user_id=actor, changed_at=now))
+        await db.commit()
+        logger.info("Alarm ticket created", ticket_id=tid, alarm_type=alarm_type, camera_id=camera_id)
+        return {"message": "alarm ticket created", "ticket_id": tid,
+                "ticket_number": tnum, "status": "open", "created": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to upsert alarm", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to process alarm")
 
 
 @app.get("/api/tickets")
@@ -399,7 +550,7 @@ async def get_ticket(
             "comments": [
                 {
                     "id": c.id,
-                    "comment": c.comment,
+                    "comment": c.comment_text,
                     "is_internal": c.is_internal,
                     "created_at": c.created_at if c.created_at else None
                 }
@@ -481,7 +632,8 @@ async def update_ticket_status(
             comment = TicketComment(
                 id=str(uuid.uuid4()),
                 ticket_id=ticket.id,
-                comment=json_data['comment'],
+                user_id=current_user.id,
+                comment_text=json_data['comment'],
                 is_internal=json_data.get('is_internal', False),
                 created_at=_time.time()
             )
@@ -542,7 +694,8 @@ async def add_comment(
         comment = TicketComment(
             id=str(uuid.uuid4()),
             ticket_id=ticket_id,
-            comment=json_data['comment'],
+            user_id=current_user.id,
+            comment_text=json_data['comment'],
             is_internal=json_data.get('is_internal', False),
             created_at=_time.time()
         )
