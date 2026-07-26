@@ -13,7 +13,7 @@ import time as _time
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, update, func, text
+from sqlalchemy import select, and_, or_, update, func, text, delete
 from sqlalchemy.orm import selectinload
 import structlog
 
@@ -637,6 +637,253 @@ async def assign_ticket(
     except Exception as e:
         logger.error("Failed to assign", ticket_id=ticket_id, error=str(e))
         raise HTTPException(status_code=500, detail="Failed to assign ticket")
+
+
+# ============================================================================
+# WS1 — Escalation policy CRUD + test-fire (config API for the matrix builder).
+# ============================================================================
+def _is_admin(user) -> bool:
+    return bool(user) and getattr(user, "role", None) in ("administrator", "org_admin")
+
+
+def _serialize_policy(p, levels, recips_by_level, actions_by_level) -> Dict[str, Any]:
+    return {
+        "id": p.id, "name": p.name, "organization_id": p.organization_id, "enabled": p.enabled,
+        "match_event_types": p.match_event_types, "match_severity": p.match_severity,
+        "match_zone_id": p.match_zone_id, "active_window": p.active_window, "priority": p.priority,
+        "levels": [{
+            "id": l.id, "level_no": l.level_no, "wait_seconds": l.wait_seconds, "stop_on_ack": l.stop_on_ack,
+            "recipients": [{"id": r.id, "recipient_type": r.recipient_type, "role_id": r.role_id,
+                            "user_id": r.user_id, "external_ref": r.external_ref, "channels": r.channels}
+                           for r in recips_by_level.get(l.id, [])],
+            "actions": [{"id": a.id, "action_type": a.action_type, "params": a.params}
+                        for a in actions_by_level.get(l.id, [])],
+        } for l in levels],
+    }
+
+
+async def _write_levels(db, policy_id, levels):
+    """Create level rows (+ their recipients + actions) from a payload list."""
+    for lv in levels or []:
+        lid = str(_uuid.uuid4())
+        db.add(EscalationLevel(id=lid, policy_id=policy_id, level_no=int(lv.get("level_no", 1)),
+                               wait_seconds=int(lv.get("wait_seconds", 0)),
+                               stop_on_ack=bool(lv.get("stop_on_ack", True))))
+        for r in lv.get("recipients", []) or []:
+            db.add(EscalationRecipient(id=str(_uuid.uuid4()), level_id=lid,
+                   recipient_type=r.get("recipient_type", "zone_role"), role_id=r.get("role_id"),
+                   user_id=r.get("user_id"), external_ref=r.get("external_ref"), channels=r.get("channels")))
+        for a in lv.get("actions", []) or []:
+            db.add(EscalationAction(id=str(_uuid.uuid4()), level_id=lid,
+                   action_type=a.get("action_type", "notify"), params=a.get("params")))
+
+
+async def _load_policy_tree(db, p) -> Dict[str, Any]:
+    levels = sorted((await db.execute(
+        select(EscalationLevel).where(EscalationLevel.policy_id == p.id))).scalars().all(),
+        key=lambda l: l.level_no)
+    lids = [l.id for l in levels]
+    recips = (await db.execute(select(EscalationRecipient).where(
+        EscalationRecipient.level_id.in_(lids)))).scalars().all() if lids else []
+    actions = (await db.execute(select(EscalationAction).where(
+        EscalationAction.level_id.in_(lids)))).scalars().all() if lids else []
+    rbl, abl = {}, {}
+    for r in recips:
+        rbl.setdefault(r.level_id, []).append(r)
+    for a in actions:
+        abl.setdefault(a.level_id, []).append(a)
+    return _serialize_policy(p, levels, rbl, abl)
+
+
+@app.get("/api/org-roles")
+async def list_org_roles(
+    organization_id: Optional[str] = None,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    """List the configurable role hierarchy (for the escalation matrix builder)."""
+    q = select(OrgRole)
+    if organization_id:
+        q = q.where(or_(OrgRole.organization_id == organization_id, OrgRole.organization_id.is_(None)))
+    roles = (await db.execute(q.order_by(OrgRole.rank))).scalars().all()
+    return {"roles": [{"id": r.id, "name": r.name, "display_name": r.display_name, "rank": r.rank,
+                       "is_system": r.is_system, "organization_id": r.organization_id} for r in roles]}
+
+
+@app.get("/api/escalation-policies")
+async def list_escalation_policies(
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    policies = (await db.execute(
+        select(EscalationPolicy).order_by(EscalationPolicy.priority.desc()))).scalars().all()
+    out = []
+    for p in policies:
+        n = (await db.execute(select(func.count()).select_from(EscalationLevel).where(
+            EscalationLevel.policy_id == p.id))).scalar()
+        out.append({"id": p.id, "name": p.name, "organization_id": p.organization_id, "enabled": p.enabled,
+                    "match_event_types": p.match_event_types, "match_severity": p.match_severity,
+                    "match_zone_id": p.match_zone_id, "priority": p.priority, "level_count": n})
+    return {"policies": out}
+
+
+@app.get("/api/escalation-policies/{policy_id}")
+async def get_escalation_policy(
+    policy_id: str,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    p = (await db.execute(select(EscalationPolicy).where(EscalationPolicy.id == policy_id))).scalar_one_or_none()
+    if not p:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    return await _load_policy_tree(db, p)
+
+
+@app.post("/api/escalation-policies")
+async def create_escalation_policy(
+    request: Request,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        data = await request.json()
+        if not data.get("name"):
+            raise HTTPException(status_code=400, detail="name is required")
+        now = _time.time()
+        pid = str(_uuid.uuid4())
+        db.add(EscalationPolicy(
+            id=pid, name=data["name"], organization_id=data.get("organization_id"),
+            enabled=bool(data.get("enabled", True)), match_event_types=data.get("match_event_types"),
+            match_severity=data.get("match_severity"), match_zone_id=data.get("match_zone_id"),
+            active_window=data.get("active_window"), priority=int(data.get("priority", 0)),
+            created_at=now, updated_at=now))
+        await _write_levels(db, pid, data.get("levels", []))
+        await db.commit()
+        p = (await db.execute(select(EscalationPolicy).where(EscalationPolicy.id == pid))).scalar_one()
+        return await _load_policy_tree(db, p)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to create policy", error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to create policy")
+
+
+@app.put("/api/escalation-policies/{policy_id}")
+async def update_escalation_policy(
+    policy_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        p = (await db.execute(select(EscalationPolicy).where(EscalationPolicy.id == policy_id))).scalar_one_or_none()
+        if not p:
+            raise HTTPException(status_code=404, detail="Policy not found")
+        data = await request.json()
+        for f in ("name", "organization_id", "enabled", "match_event_types", "match_severity",
+                  "match_zone_id", "active_window", "priority"):
+            if f in data:
+                setattr(p, f, data[f])
+        p.updated_at = _time.time()
+        # Replace-all for the level tree when 'levels' is provided.
+        if "levels" in data:
+            lids = [l.id for l in (await db.execute(
+                select(EscalationLevel).where(EscalationLevel.policy_id == policy_id))).scalars().all()]
+            if lids:
+                await db.execute(delete(EscalationRecipient).where(EscalationRecipient.level_id.in_(lids)))
+                await db.execute(delete(EscalationAction).where(EscalationAction.level_id.in_(lids)))
+                await db.execute(delete(EscalationLevel).where(EscalationLevel.policy_id == policy_id))
+            await _write_levels(db, policy_id, data["levels"])
+        await db.commit()
+        p = (await db.execute(select(EscalationPolicy).where(EscalationPolicy.id == policy_id))).scalar_one()
+        return await _load_policy_tree(db, p)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to update policy", policy_id=policy_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to update policy")
+
+
+@app.delete("/api/escalation-policies/{policy_id}")
+async def delete_escalation_policy(
+    policy_id: str,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    try:
+        lids = [l.id for l in (await db.execute(
+            select(EscalationLevel).where(EscalationLevel.policy_id == policy_id))).scalars().all()]
+        if lids:
+            await db.execute(delete(EscalationRecipient).where(EscalationRecipient.level_id.in_(lids)))
+            await db.execute(delete(EscalationAction).where(EscalationAction.level_id.in_(lids)))
+            await db.execute(delete(EscalationLevel).where(EscalationLevel.policy_id == policy_id))
+        # Detach any tickets still pointing at this policy (FK + halt their escalation).
+        await db.execute(update(Ticket).where(Ticket.escalation_policy_id == policy_id).values(
+            escalation_policy_id=None, next_escalation_at=None))
+        await db.execute(delete(EscalationPolicy).where(EscalationPolicy.id == policy_id))
+        await db.commit()
+        return {"message": "deleted", "id": policy_id}
+    except Exception as e:
+        logger.error("Failed to delete policy", policy_id=policy_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to delete policy")
+
+
+@app.post("/api/escalation-policies/{policy_id}/test-fire")
+async def test_fire_policy(
+    policy_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    """Dry-run: for a hypothetical alarm, show who would be notified at each level
+    and when (cumulative seconds). Body (all optional): camera_id, alarm_type,
+    severity, organization_id. Resolves real recipients via the engine — nothing
+    is created or sent."""
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    p = (await db.execute(select(EscalationPolicy).where(EscalationPolicy.id == policy_id))).scalar_one_or_none()
+    if not p:
+        raise HTTPException(status_code=404, detail="Policy not found")
+    data = await request.json() if await request.body() else {}
+
+    # A lightweight ticket-shaped object for recipient/zone resolution.
+    class _Probe:
+        pass
+    probe = _Probe()
+    probe.camera_id = data.get("camera_id")
+    probe.alarm_type = data.get("alarm_type")
+    probe.severity = data.get("severity", "high")
+    probe.organization_id = data.get("organization_id") or p.organization_id
+
+    levels = sorted((await db.execute(
+        select(EscalationLevel).where(EscalationLevel.policy_id == policy_id))).scalars().all(),
+        key=lambda l: l.level_no)
+    cum, out_levels = 0, []
+    for i, l in enumerate(levels):
+        if i > 0:
+            cum += (l.wait_seconds or 0)
+        recips = (await db.execute(select(EscalationRecipient).where(
+            EscalationRecipient.level_id == l.id))).scalars().all()
+        who = []
+        for r in recips:
+            if r.recipient_type == "zone_role" and r.role_id:
+                users = await _recipients_for_role(db, probe, r.role_id)
+                who += [{"user_id": u.id, "username": u.username, "role": u.role, "channels": r.channels}
+                        for u in users]
+            elif r.recipient_type == "user" and r.user_id:
+                u = (await db.execute(select(User).where(User.id == r.user_id))).scalar_one_or_none()
+                if u:
+                    who.append({"user_id": u.id, "username": u.username, "role": u.role, "channels": r.channels})
+            elif r.recipient_type == "external" and r.external_ref:
+                who.append({"external": r.external_ref, "channels": r.channels})
+        out_levels.append({"level_no": l.level_no, "fires_after_seconds": cum, "recipients": who})
+    return {"policy_id": policy_id, "policy_name": p.name, "levels": out_levels}
 
 
 @app.get("/api/tickets")
