@@ -18,12 +18,15 @@ from sqlalchemy.orm import selectinload
 import structlog
 
 # Import shared modules - using installed vms-shared package
-from database import db_manager, get_db, get_db_session
+from database import db_manager, get_db, get_db_session, get_redis
 from models import (
     Ticket, TicketComment, TicketStateHistory, AlarmEventLink,
-    NotificationLog, AnalyticsProvider, User, Camera,
+    NotificationLog, AnalyticsProvider, User, Camera, Zone, UserZoneAccess,
+    OrgRole, EscalationPolicy, EscalationLevel, EscalationRecipient, EscalationAction,
     TicketStatus
 )
+import json
+import uuid as _uuid
 from auth import get_current_user_flexible, get_user_from_headers
 from zone_scoping import resolve_user_zone_ids, scope_by_camera_id
 
@@ -84,6 +87,210 @@ async def _ensure_escalation_schema():
         logger.warning("Escalation self-migration skipped/failed", error=str(e))
 
 
+# ============================================================================
+# WS1 — Escalation engine (see compliances/WS1_ESCALATION_RBAC_PLAN.md).
+#   alarm fired → match policy → schedule → fire levels over time (resolving
+#   zone-scoped recipients) → halt on ack/resolve. In-app delivery is live now
+#   via the event WS bus (notify:user channel → event-management send_to_user);
+#   email/SMS are written to notification_logs as 'pending' for WS2 to send.
+# ============================================================================
+NOTIFY_USER_CHANNEL = "notify:user"
+ESCALATION_TICK_SECONDS = int(os.getenv("ESCALATION_TICK_SECONDS", "15"))
+_SEV_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _stamp_ack(ticket, user_id, now):
+    """First response / acknowledge stamps (WS1) — also HALTS escalation. Idempotent."""
+    if ticket.acknowledged_at is None:
+        ticket.acknowledged_at = now
+        ticket.acknowledged_by = user_id
+    if ticket.first_response_at is None:
+        ticket.first_response_at = now
+        ticket.first_response_time_seconds = int(now - (ticket.created_at or now))
+    ticket.next_escalation_at = None
+    ticket.updated_at = now
+
+
+async def _alarm_zone_path(db, ticket):
+    """Materialized-path of the alarm's zone (via camera). None if camera-less/unzoned."""
+    if ticket.camera_id is None:
+        return None
+    zid = (await db.execute(select(Camera.zone_id).where(Camera.id == ticket.camera_id))).scalar_one_or_none()
+    if not zid:
+        return None
+    return (await db.execute(select(Zone.path).where(Zone.id == zid))).scalar_one_or_none()
+
+
+async def _match_policy(db, ticket):
+    """Best enabled escalation policy for a ticket: org (or NULL-org) ∧ event-type
+    ∧ min-severity ∧ zone-subtree. Highest priority wins."""
+    q = select(EscalationPolicy).where(
+        EscalationPolicy.enabled == True,
+        or_(EscalationPolicy.organization_id == ticket.organization_id,
+            EscalationPolicy.organization_id.is_(None)),
+    ).order_by(EscalationPolicy.priority.desc())
+    policies = (await db.execute(q)).scalars().all()
+    if not policies:
+        return None
+    alarm_path = await _alarm_zone_path(db, ticket)
+    tsev = _SEV_RANK.get((ticket.severity or "").lower(), 0)
+    for p in policies:
+        if p.match_event_types and (ticket.alarm_type or "") not in p.match_event_types:
+            continue
+        if p.match_severity and tsev < _SEV_RANK.get(p.match_severity.lower(), 0):
+            continue
+        if p.match_zone_id:
+            pzpath = (await db.execute(select(Zone.path).where(Zone.id == p.match_zone_id))).scalar_one_or_none()
+            if not (alarm_path and pzpath and alarm_path.startswith(pzpath)):
+                continue
+        return p
+    return None
+
+
+async def _recipients_for_role(db, ticket, role_id):
+    """Users holding the given org_role who can see the alarm's zone: global grant,
+    a grant covering the alarm's zone (ancestor-or-self), or NO zone grants at all
+    (treated as unrestricted, mirroring admin scoping). Camera-less alarms → only
+    global/unrestricted holders."""
+    role = (await db.execute(select(OrgRole).where(OrgRole.id == role_id))).scalar_one_or_none()
+    if not role:
+        return []
+    role_users = (await db.execute(
+        select(User).where(User.role == role.name, User.is_active == True))).scalars().all()
+    if not role_users:
+        return []
+    uids = [u.id for u in role_users]
+    alarm_path = await _alarm_zone_path(db, ticket)
+    rows = (await db.execute(
+        select(UserZoneAccess.user_id, UserZoneAccess.is_global, Zone.path)
+        .select_from(UserZoneAccess).outerjoin(Zone, Zone.id == UserZoneAccess.zone_id)
+        .where(UserZoneAccess.user_id.in_(uids)))).all()
+    grants = {}
+    for uid, is_global, gpath in rows:
+        grants.setdefault(uid, []).append((is_global, gpath))
+    out = []
+    for u in role_users:
+        g = grants.get(u.id)
+        if not g:
+            out.append(u)                                   # no grants → unrestricted
+        elif any(isg for isg, _ in g):
+            out.append(u)                                   # global grant
+        elif alarm_path and any(gp and alarm_path.startswith(gp) for _, gp in g):
+            out.append(u)                                   # covers the alarm's zone
+    return out
+
+
+async def _fire_level(db, ticket, level, now):
+    """Resolve recipients + write notification_logs + in-app push + run actions.
+    Returns the set of notified user ids."""
+    recips = (await db.execute(
+        select(EscalationRecipient).where(EscalationRecipient.level_id == level.id))).scalars().all()
+    notified = set()
+    for r in recips:
+        users = []
+        if r.recipient_type == "zone_role" and r.role_id:
+            users = await _recipients_for_role(db, ticket, r.role_id)
+        elif r.recipient_type == "user" and r.user_id:
+            u = (await db.execute(select(User).where(User.id == r.user_id))).scalar_one_or_none()
+            if u:
+                users = [u]
+        # 'external' recipients need WS2 senders — skipped for now.
+        channels = r.channels or ["push"]
+        for u in users:
+            for ch in channels:
+                db.add(NotificationLog(
+                    id=str(_uuid.uuid4()), ticket_id=ticket.id, user_id=u.id,
+                    channel_type=ch, template_name="escalation",
+                    status=("sent" if ch == "push" else "pending"),
+                    sent_at=(now if ch == "push" else None), created_at=now))
+            notified.add(u.id)
+
+    for a in (await db.execute(
+            select(EscalationAction).where(EscalationAction.level_id == level.id))).scalars().all():
+        if a.action_type == "auto_assign" and notified and not ticket.assigned_to_user_id:
+            ticket.assigned_to_user_id = min(notified)
+            ticket.assigned_at = now
+
+    if notified:
+        try:
+            r = await get_redis()
+            await r.publish(NOTIFY_USER_CHANNEL, json.dumps({
+                "user_ids": sorted(notified),
+                "ticket_id": ticket.id, "ticket_number": ticket.ticket_number,
+                "title": ticket.title, "severity": ticket.severity,
+                "level": ticket.escalation_level, "alarm_type": ticket.alarm_type,
+            }))
+        except Exception as e:
+            logger.warning("notify:user publish failed", error=str(e))
+
+    db.add(TicketStateHistory(
+        id=str(_uuid.uuid4()), ticket_id=ticket.id,
+        from_status=ticket.status, to_status=ticket.status, changed_by_user_id=1,
+        reason=f"Escalation L{ticket.escalation_level} fired → {len(notified)} recipient(s)",
+        changed_at=now))
+    logger.info("Escalation level fired", ticket_id=ticket.id,
+                level=ticket.escalation_level, recipients=len(notified))
+    return notified
+
+
+async def _start_escalation(db, ticket):
+    """On a new alarm: match a policy, set level 1, schedule the next level, fire L1.
+    No-op if no policy matches. Best-effort — never breaks alarm creation."""
+    try:
+        policy = await _match_policy(db, ticket)
+        if not policy:
+            return
+        levels = sorted(
+            (await db.execute(select(EscalationLevel).where(EscalationLevel.policy_id == policy.id))).scalars().all(),
+            key=lambda l: l.level_no)
+        if not levels:
+            return
+        now = _time.time()
+        ticket.escalation_policy_id = policy.id
+        ticket.escalation_level = levels[0].level_no
+        ticket.escalated_at = now
+        ticket.next_escalation_at = (now + (levels[1].wait_seconds or 0)) if len(levels) > 1 else None
+        await _fire_level(db, ticket, levels[0], now)
+    except Exception as e:
+        logger.warning("start_escalation failed", ticket_id=getattr(ticket, "id", None), error=str(e))
+
+
+async def _escalation_scheduler_loop():
+    """Advance unacknowledged tickets to their next level when due (~ESCALATION_TICK_SECONDS)."""
+    await asyncio.sleep(10)  # let startup settle
+    while True:
+        try:
+            now = _time.time()
+            async with db_manager.get_session() as db:
+                due = (await db.execute(select(Ticket).where(
+                    Ticket.next_escalation_at.is_not(None),
+                    Ticket.next_escalation_at <= now,
+                    Ticket.acknowledged_at.is_(None),
+                    Ticket.status.in_(("open", "assigned", "in_progress")),
+                ))).scalars().all()
+                for ticket in due:
+                    levels = sorted(
+                        (await db.execute(select(EscalationLevel).where(
+                            EscalationLevel.policy_id == ticket.escalation_policy_id))).scalars().all(),
+                        key=lambda l: l.level_no)
+                    cur = next((i for i, l in enumerate(levels) if l.level_no == ticket.escalation_level), -1)
+                    nxt = levels[cur + 1] if 0 <= cur < len(levels) - 1 else None
+                    if not nxt:
+                        ticket.next_escalation_at = None
+                        continue
+                    ticket.escalation_level = nxt.level_no
+                    ticket.escalated_at = now
+                    await _fire_level(db, ticket, nxt, now)
+                    after = levels[cur + 2] if cur + 2 < len(levels) else None
+                    ticket.next_escalation_at = (now + (after.wait_seconds or 0)) if after else None
+                await db.commit()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Escalation scheduler error", error=str(e))
+        await asyncio.sleep(ESCALATION_TICK_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -92,12 +299,19 @@ async def lifespan(app: FastAPI):
     await db_manager.initialize()
     await _ensure_alarm_schema()
     await _ensure_escalation_schema()
+    # WS1: the escalation scheduler — ticket-service's first background worker.
+    escalation_task = asyncio.create_task(_escalation_scheduler_loop())
     logger.info("Ticket Service started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down Ticket Service...")
+    escalation_task.cancel()
+    try:
+        await escalation_task
+    except (asyncio.CancelledError, Exception):
+        pass
     await db_manager.cleanup()
     logger.info("Ticket Service shutdown complete")
 
@@ -342,6 +556,9 @@ async def upsert_alarm(
         await _link(tid)
         db.add(TicketStateHistory(id=str(uuid.uuid4()), ticket_id=tid,
             from_status="", to_status="open", changed_by_user_id=actor, changed_at=now))
+        # WS1: kick off escalation for this new alarm (match policy → fire L1 →
+        # schedule). No-op if no policy matches. Same transaction.
+        await _start_escalation(db, ticket)
         await db.commit()
         logger.info("Alarm ticket created", ticket_id=tid, alarm_type=alarm_type, camera_id=camera_id)
         return {"message": "alarm ticket created", "ticket_id": tid,
@@ -352,6 +569,74 @@ async def upsert_alarm(
     except Exception as e:
         logger.error("Failed to upsert alarm", error=str(e))
         raise HTTPException(status_code=500, detail="Failed to process alarm")
+
+
+@app.post("/api/tickets/{ticket_id}/acknowledge")
+async def acknowledge_ticket(
+    ticket_id: str,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    """Acknowledge a ticket (WS1) — stamps first_response/acknowledged and HALTS
+    escalation (clause 50.6). Moves 'open' → 'in_progress'."""
+    try:
+        ticket = (await db.execute(select(Ticket).where(Ticket.id == ticket_id))).scalar_one_or_none()
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        now = _time.time()
+        already = ticket.acknowledged_at is not None
+        old_status = ticket.status
+        _stamp_ack(ticket, current_user.id, now)
+        if ticket.status == "open":
+            ticket.status = "in_progress"
+        db.add(TicketStateHistory(id=str(_uuid.uuid4()), ticket_id=ticket.id,
+            from_status=old_status, to_status=ticket.status, changed_by_user_id=current_user.id,
+            reason=("Re-acknowledged" if already else "Acknowledged"), changed_at=now))
+        await db.commit()
+        return {"message": "acknowledged", "ticket_id": ticket.id,
+                "acknowledged_at": ticket.acknowledged_at, "status": ticket.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to acknowledge", ticket_id=ticket_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to acknowledge ticket")
+
+
+@app.post("/api/tickets/{ticket_id}/assign")
+async def assign_ticket(
+    ticket_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    """Assign a ticket to a user (WS1). Taking ownership also acknowledges, so it
+    halts escalation. Body: {"assigned_to_user_id": <int>}."""
+    try:
+        data = await request.json()
+        assignee = data.get("assigned_to_user_id")
+        if assignee is None:
+            raise HTTPException(status_code=400, detail="assigned_to_user_id is required")
+        ticket = (await db.execute(select(Ticket).where(Ticket.id == ticket_id))).scalar_one_or_none()
+        if not ticket:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        now = _time.time()
+        old_status = ticket.status
+        ticket.assigned_to_user_id = int(assignee)
+        ticket.assigned_at = now
+        if ticket.status == "open":
+            ticket.status = "assigned"
+        _stamp_ack(ticket, current_user.id, now)
+        db.add(TicketStateHistory(id=str(_uuid.uuid4()), ticket_id=ticket.id,
+            from_status=old_status, to_status=ticket.status, changed_by_user_id=current_user.id,
+            reason=f"Assigned to user {assignee}", changed_at=now))
+        await db.commit()
+        return {"message": "assigned", "ticket_id": ticket.id,
+                "assigned_to_user_id": ticket.assigned_to_user_id, "status": ticket.status}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Failed to assign", ticket_id=ticket_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to assign ticket")
 
 
 @app.get("/api/tickets")
@@ -633,10 +918,23 @@ async def update_ticket_status(
             raise HTTPException(status_code=404, detail="Ticket not found")
 
         old_status = ticket.status
+        now = _time.time()
 
         # Update ticket
         ticket.status = new_status
-        ticket.updated_at = _time.time()
+        ticket.updated_at = now
+
+        # WS1: any move off 'open' is a response → stamp ack + halt escalation.
+        if new_status != "open":
+            _stamp_ack(ticket, current_user.id, now)
+        # Resolution timestamps + SLA duration.
+        if new_status in ("resolved", "closed", "false_positive"):
+            if ticket.resolved_at is None:
+                ticket.resolved_at = now
+                ticket.resolution_time_seconds = int(now - (ticket.created_at or now))
+            if new_status == "closed":
+                ticket.closed_at = now
+            ticket.next_escalation_at = None
 
         import uuid
         state_history = TicketStateHistory(
