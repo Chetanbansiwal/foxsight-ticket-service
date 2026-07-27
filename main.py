@@ -180,6 +180,47 @@ async def _recipients_for_role(db, ticket, role_id):
     return out
 
 
+CAMERA_MANAGEMENT_URL = os.getenv("SERVICE_CAMERA_MANAGEMENT_URL", "http://camera-management:8000")
+
+
+async def _run_response_action(action, ticket) -> None:
+    """Execute a programmed response action (WS4, clause 50.8). Best-effort —
+    swallows all errors so escalation never stalls on an unreachable relay/URL.
+      - actuate_relay: params {output_token, state?} → drive the ticket camera's
+        ONVIF relay output via camera-management (service-identity headers).
+      - webhook:       params {url} → POST a compact ticket summary."""
+    import httpx
+    params = action.params or {}
+    try:
+        if action.action_type == "actuate_relay":
+            token = params.get("output_token") or params.get("token")
+            if not token or ticket.camera_id is None:
+                logger.warning("actuate_relay skipped: missing output_token or camera", ticket_id=ticket.id)
+                return
+            url = f"{CAMERA_MANAGEMENT_URL}/cameras/{ticket.camera_id}/relay-outputs/{token}"
+            headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "escalation-engine"}
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(url, json={"state": params.get("state", "active")}, headers=headers)
+                logger.info("actuate_relay fired", ticket_id=ticket.id, camera_id=ticket.camera_id,
+                            token=token, status=r.status_code)
+        elif action.action_type == "webhook":
+            url = params.get("url")
+            if not url:
+                return
+            payload = {
+                "ticket_id": ticket.id, "ticket_number": ticket.ticket_number,
+                "title": ticket.title, "severity": ticket.severity,
+                "alarm_type": ticket.alarm_type, "camera_id": ticket.camera_id,
+                "escalation_level": ticket.escalation_level,
+            }
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                r = await client.post(url, json=payload)
+                logger.info("webhook fired", ticket_id=ticket.id, url=url, status=r.status_code)
+    except Exception as e:
+        logger.warning("response action failed", action_type=action.action_type,
+                       ticket_id=ticket.id, error=str(e))
+
+
 async def _fire_level(db, ticket, level, now):
     """Resolve recipients + write notification_logs + in-app push + run actions.
     Returns the set of notified user ids."""
@@ -210,6 +251,11 @@ async def _fire_level(db, ticket, level, now):
         if a.action_type == "auto_assign" and notified and not ticket.assigned_to_user_id:
             ticket.assigned_to_user_id = min(notified)
             ticket.assigned_at = now
+        elif a.action_type in ("actuate_relay", "webhook"):
+            # WS4 (clause 50.8): programmed response — drive a camera relay
+            # output or hit a webhook when this level fires. Best-effort: a
+            # dead relay/URL must not stall the escalation loop.
+            await _run_response_action(a, ticket)
 
     if notified:
         try:
