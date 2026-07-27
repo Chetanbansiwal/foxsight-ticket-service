@@ -1091,6 +1091,99 @@ async def get_ticket_stats(
         raise HTTPException(status_code=500, detail="Failed to get ticket stats")
 
 
+@app.get("/api/tickets/{ticket_id}/report")
+async def get_ticket_report(
+    ticket_id: str,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """WS5 (clauses 50.9 / 47 / 51): consolidated incident e-report + audit
+    timeline for one ticket — metadata + snapshot/clip refs + comments +
+    escalation fires + notification log, merged into one time-ordered audit that
+    answers who-was-notified / who-ack'd / who-actioned / when. The web-client
+    renders this print-ready (PDF via print) and CSV-exports the timeline."""
+    result = await db.execute(
+        select(Ticket).where(Ticket.id == ticket_id).options(
+            selectinload(Ticket.camera),
+            selectinload(Ticket.assigned_to),
+            selectinload(Ticket.comments),
+            selectinload(Ticket.state_history),
+        )
+    )
+    ticket = result.scalar_one_or_none()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    # Zone/Area scoping (WS-Z): same visibility rule as ticket detail.
+    zone_ids = await resolve_user_zone_ids(current_user, db)
+    if zone_ids is not None:
+        cam_zone = ticket.camera.zone_id if ticket.camera else None
+        if cam_zone not in zone_ids:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+
+    notifs = (await db.execute(select(NotificationLog).where(
+        NotificationLog.ticket_id == ticket_id))).scalars().all()
+    comments = list(ticket.comments or [])
+    history = list(ticket.state_history or [])
+
+    uids = {h.changed_by_user_id for h in history} | {c.user_id for c in comments} | {n.user_id for n in notifs}
+    if ticket.assigned_to_user_id:
+        uids.add(ticket.assigned_to_user_id)
+    if ticket.acknowledged_by:
+        uids.add(ticket.acknowledged_by)
+    uids.discard(None)
+    names = {}
+    if uids:
+        for u in (await db.execute(select(User).where(User.id.in_(uids)))).scalars().all():
+            names[u.id] = u.username
+    who = lambda uid: names.get(uid) or (f"system" if uid in (0, 1) else (f"user {uid}" if uid else "—"))
+
+    timeline = []
+    for h in history:
+        is_escalation = (h.reason or "").startswith("Escalation ")
+        timeline.append({
+            "ts": h.changed_at, "kind": "escalation" if is_escalation else "status",
+            "actor": who(h.changed_by_user_id),
+            "detail": h.reason or (f"{h.from_status} → {h.to_status}" if h.from_status else f"→ {h.to_status}"),
+        })
+    for c in comments:
+        timeline.append({"ts": c.created_at, "kind": "comment", "actor": who(c.user_id), "detail": c.comment_text})
+    for n in notifs:
+        detail = f"{n.channel_type} → {n.status}"
+        if n.error_message:
+            detail += f" ({n.error_message})"
+        timeline.append({"ts": (n.sent_at or n.failed_at or n.created_at), "kind": "notification",
+                         "actor": who(n.user_id), "detail": detail})
+    timeline.sort(key=lambda e: e["ts"] or 0)
+
+    return {
+        "generated_at": _time.time(),
+        "generated_by": current_user.username,
+        "ticket": {
+            "id": ticket.id, "ticket_number": ticket.ticket_number, "title": ticket.title,
+            "description": ticket.description, "severity": ticket.severity, "status": ticket.status,
+            "alarm_type": ticket.alarm_type, "is_latched": ticket.is_latched,
+            "created_at": ticket.created_at, "resolved_at": ticket.resolved_at,
+            "assigned_to": who(ticket.assigned_to_user_id) if ticket.assigned_to_user_id else None,
+            "acknowledged_at": ticket.acknowledged_at, "acknowledged_by": who(ticket.acknowledged_by) if ticket.acknowledged_by else None,
+            "sla_breach": ticket.sla_breach, "detection_count": ticket.detection_count,
+            "thumbnail_url": ticket.thumbnail_url, "video_clip_url": ticket.video_clip_url,
+        },
+        "camera": {"id": ticket.camera_id, "name": ticket.camera.name if ticket.camera else None,
+                   "location": getattr(ticket.camera, "location", None) if ticket.camera else None},
+        "escalation": {
+            "policy_id": ticket.escalation_policy_id, "level": ticket.escalation_level,
+            "escalated_at": ticket.escalated_at, "next_escalation_at": ticket.next_escalation_at,
+        },
+        "comments": [{"actor": who(c.user_id), "text": c.comment_text, "at": c.created_at,
+                      "internal": bool(c.is_internal)} for c in sorted(comments, key=lambda c: c.created_at or 0)],
+        "notifications": [{"actor": who(n.user_id), "channel": n.channel_type, "status": n.status,
+                           "at": (n.sent_at or n.failed_at or n.created_at), "error": n.error_message}
+                          for n in sorted(notifs, key=lambda n: (n.sent_at or n.created_at or 0))],
+        "timeline": timeline,
+    }
+
+
 @app.get("/api/tickets/{ticket_id}")
 async def get_ticket(
     ticket_id: str,
