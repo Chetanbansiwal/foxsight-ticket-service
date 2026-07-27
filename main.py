@@ -941,6 +941,8 @@ async def list_tickets(
     camera_id: Optional[int] = Query(None, description="Filter by camera"),
     organization_id: Optional[str] = Query(None, description="Filter by organization"),
     assigned_to: Optional[int] = Query(None, description="Filter by assigned user"),
+    alarm_type: Optional[str] = Query(None, description="Filter by alarm type"),
+    alarms_only: Optional[bool] = Query(None, description="Only alarm tickets (alarm_type set)"),
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0)
 ):
@@ -969,6 +971,11 @@ async def list_tickets(
             filters.append(Ticket.organization_id == organization_id)
         if assigned_to:
             filters.append(Ticket.assigned_to_user_id == assigned_to)
+        # WS3 alarm surface: filter to alarm tickets (or a specific alarm type).
+        if alarm_type:
+            filters.append(Ticket.alarm_type == alarm_type)
+        elif alarms_only:
+            filters.append(Ticket.alarm_type.is_not(None))
 
         if filters:
             query = query.where(and_(*filters))
@@ -1014,7 +1021,11 @@ async def list_tickets(
                     "created_at": t.created_at if t.created_at else None,
                     "updated_at": t.updated_at if t.updated_at else None,
                     "thumbnail_url": t.thumbnail_url,
-                    "sla_breach": t.sla_breach
+                    "sla_breach": t.sla_breach,
+                    # WS3 alarm surface: latched-alarm rendering + type filter.
+                    "alarm_type": t.alarm_type,
+                    "is_latched": t.is_latched,
+                    "acknowledged_at": t.acknowledged_at,
                 }
                 for t in tickets
             ],
