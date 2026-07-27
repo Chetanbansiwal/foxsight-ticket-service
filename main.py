@@ -23,6 +23,7 @@ from models import (
     Ticket, TicketComment, TicketStateHistory, AlarmEventLink,
     NotificationLog, AnalyticsProvider, User, Camera, Zone, UserZoneAccess,
     OrgRole, EscalationPolicy, EscalationLevel, EscalationRecipient, EscalationAction,
+    SLAPolicy, ShiftRoster,
     TicketStatus
 )
 import json
@@ -143,7 +144,59 @@ async def _match_policy(db, ticket):
             pzpath = (await db.execute(select(Zone.path).where(Zone.id == p.match_zone_id))).scalar_one_or_none()
             if not (alarm_path and pzpath and alarm_path.startswith(pzpath)):
                 continue
+        # WS6: time-scoped policies (e.g. a night-shift matrix) only match in-window.
+        aw = p.active_window or {}
+        if aw and not _in_time_window(aw.get("days"), aw.get("start"), aw.get("end"), aw.get("tz", "UTC")):
+            continue
         return p
+    return None
+
+
+def _in_time_window(days, start, end, tz, now_ts=None):
+    """WS6: is 'now' (in tz) inside [start,end] on an allowed weekday? Handles
+    midnight-wrap (start>end); for a wrapped window the post-midnight tail counts
+    against the weekday the shift STARTED. days = [0..6] (Mon..Sun) or falsy=any."""
+    from datetime import datetime, time as _dtime
+    ts = now_ts if now_ts is not None else _time.time()
+    try:
+        from zoneinfo import ZoneInfo
+        now = datetime.fromtimestamp(ts, ZoneInfo(tz or "UTC"))
+    except Exception:
+        now = datetime.utcfromtimestamp(ts)
+    eff_day = now.weekday()
+    if start and end:
+        def _p(t):
+            h, m = str(t).split(":")
+            return _dtime(int(h), int(m))
+        s, e, cur = _p(start), _p(end), now.time()
+        if s <= e:
+            if not (s <= cur < e):
+                return False
+        else:  # wraps midnight
+            if not (cur >= s or cur < e):
+                return False
+            if cur < e:
+                eff_day = (now.weekday() - 1) % 7
+    if days:
+        return eff_day in days
+    return True
+
+
+async def _oncall_user_for(db, ticket, role_name):
+    """WS6: the on-call user id for this role right now, from the shift roster
+    (scoped to the alarm's zone subtree), or None if no shift covers now."""
+    rosters = (await db.execute(
+        select(ShiftRoster).where(ShiftRoster.role_name == role_name))).scalars().all()
+    if not rosters:
+        return None
+    alarm_path = await _alarm_zone_path(db, ticket)
+    for r in rosters:
+        if r.zone_id:
+            zpath = (await db.execute(select(Zone.path).where(Zone.id == r.zone_id))).scalar_one_or_none()
+            if not (alarm_path and zpath and alarm_path.startswith(zpath)):
+                continue
+        if _in_time_window(r.weekdays, r.start_time, r.end_time, r.tz or "UTC"):
+            return r.on_call_user_id
     return None
 
 
@@ -177,6 +230,18 @@ async def _recipients_for_role(db, ticket, role_id):
             out.append(u)                                   # global grant
         elif alarm_path and any(gp and alarm_path.startswith(gp) for _, gp in g):
             out.append(u)                                   # covers the alarm's zone
+
+    # WS6 roster: if a shift covers now for this role (+ the alarm's zone),
+    # notify the on-call user specifically instead of everyone holding the role.
+    oncall = await _oncall_user_for(db, ticket, role.name)
+    if oncall is not None:
+        oc = next((u for u in out if u.id == oncall), None)
+        if oc:
+            return [oc]
+        ocu = (await db.execute(
+            select(User).where(User.id == oncall, User.is_active == True))).scalar_one_or_none()
+        if ocu:
+            return [ocu]
     return out
 
 
@@ -337,6 +402,58 @@ async def _escalation_scheduler_loop():
         await asyncio.sleep(ESCALATION_TICK_SECONDS)
 
 
+SLA_TICK_SECONDS = int(os.getenv("SLA_TICK_SECONDS", "60"))
+
+
+async def _sla_breach_loop():
+    """WS6: flag tickets that blow their severity's SLA. For each active,
+    not-yet-breached ticket whose severity has an SLAPolicy (org-specific, else
+    the NULL-org default), set sla_breach when it exceeds the resolve deadline,
+    or the ack deadline while still unacknowledged. Bounded batch per tick."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            now = _time.time()
+            async with db_manager.get_session() as db:
+                policies = (await db.execute(select(SLAPolicy))).scalars().all()
+                if policies:
+                    bysev = {}
+                    for p in policies:
+                        bysev[(p.organization_id, (p.severity or "").lower())] = p
+                    # Scope to alarm/incident tickets (alarm_type set) — SLA is an
+                    # incident-response deadline, not something to hang on every
+                    # analytics detection; this also bounds the scan.
+                    tickets = (await db.execute(select(Ticket).where(
+                        Ticket.status.in_(("open", "assigned", "in_progress")),
+                        Ticket.sla_breach.isnot(True),
+                        Ticket.alarm_type.isnot(None),
+                    ).order_by(Ticket.created_at.desc()).limit(500))).scalars().all()
+                    changed = 0
+                    for t in tickets:
+                        sev = (t.severity or "").lower()
+                        pol = bysev.get((t.organization_id, sev)) or bysev.get((None, sev))
+                        if not pol:
+                            continue
+                        age = now - (t.created_at or now)
+                        reason = None
+                        if pol.resolve_seconds and age > pol.resolve_seconds:
+                            reason = f"Resolution SLA breached (> {pol.resolve_seconds}s)"
+                        elif pol.ack_seconds and not t.acknowledged_at and age > pol.ack_seconds:
+                            reason = f"Acknowledgement SLA breached (> {pol.ack_seconds}s)"
+                        if reason:
+                            t.sla_breach = True
+                            t.sla_breach_reason = reason
+                            changed += 1
+                    if changed:
+                        await db.commit()
+                        logger.info("SLA breaches flagged", count=changed)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("SLA breach loop error", error=str(e))
+        await asyncio.sleep(SLA_TICK_SECONDS)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
@@ -347,6 +464,8 @@ async def lifespan(app: FastAPI):
     await _ensure_escalation_schema()
     # WS1: the escalation scheduler — ticket-service's first background worker.
     escalation_task = asyncio.create_task(_escalation_scheduler_loop())
+    # WS6: SLA-breach detector.
+    sla_task = asyncio.create_task(_sla_breach_loop())
     logger.info("Ticket Service started successfully")
 
     yield
@@ -754,6 +873,122 @@ async def list_org_roles(
     roles = (await db.execute(q.order_by(OrgRole.rank))).scalars().all()
     return {"roles": [{"id": r.id, "name": r.name, "display_name": r.display_name, "rank": r.rank,
                        "is_system": r.is_system, "organization_id": r.organization_id} for r in roles]}
+
+
+# ===== WS6: SLA policies (severity → ack/resolve deadlines) =====
+
+def _sla_out(p):
+    return {"id": p.id, "organization_id": p.organization_id, "severity": p.severity,
+            "ack_seconds": p.ack_seconds, "resolve_seconds": p.resolve_seconds,
+            "created_at": p.created_at, "updated_at": p.updated_at}
+
+
+@app.get("/api/sla-policies")
+async def list_sla_policies(current_user: User = Depends(get_current_user_flexible), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(SLAPolicy).order_by(SLAPolicy.severity))).scalars().all()
+    return {"sla_policies": [_sla_out(p) for p in rows]}
+
+
+@app.post("/api/sla-policies")
+async def upsert_sla_policy(request: Request, current_user: User = Depends(get_current_user_flexible), db: AsyncSession = Depends(get_db)):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    data = await request.json()
+    sev = (data.get("severity") or "").lower().strip()
+    if sev not in ("low", "medium", "high", "critical"):
+        raise HTTPException(status_code=400, detail="severity must be low|medium|high|critical")
+    org = data.get("organization_id")
+    now = _time.time()
+    existing = (await db.execute(select(SLAPolicy).where(
+        SLAPolicy.severity == sev,
+        SLAPolicy.organization_id == org if org else SLAPolicy.organization_id.is_(None),
+    ))).scalars().first()
+    if existing:
+        existing.ack_seconds = data.get("ack_seconds")
+        existing.resolve_seconds = data.get("resolve_seconds")
+        existing.updated_at = now
+        p = existing
+    else:
+        p = SLAPolicy(id=str(_uuid.uuid4()), organization_id=org, severity=sev,
+                      ack_seconds=data.get("ack_seconds"), resolve_seconds=data.get("resolve_seconds"),
+                      created_at=now, updated_at=now)
+        db.add(p)
+    await db.commit()
+    await db.refresh(p)
+    return _sla_out(p)
+
+
+@app.delete("/api/sla-policies/{sla_id}")
+async def delete_sla_policy(sla_id: str, current_user: User = Depends(get_current_user_flexible), db: AsyncSession = Depends(get_db)):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    await db.execute(delete(SLAPolicy).where(SLAPolicy.id == sla_id))
+    await db.commit()
+    return {"message": "deleted", "id": sla_id}
+
+
+# ===== WS6: shift roster (zone + role + time-block → on-call user) =====
+
+def _roster_out(r):
+    return {"id": r.id, "organization_id": r.organization_id, "zone_id": r.zone_id,
+            "role_name": r.role_name, "weekdays": r.weekdays, "start_time": r.start_time,
+            "end_time": r.end_time, "tz": r.tz, "on_call_user_id": r.on_call_user_id,
+            "created_at": r.created_at, "updated_at": r.updated_at}
+
+
+@app.get("/api/shift-roster")
+async def list_shift_roster(current_user: User = Depends(get_current_user_flexible), db: AsyncSession = Depends(get_db)):
+    rows = (await db.execute(select(ShiftRoster).order_by(ShiftRoster.role_name, ShiftRoster.start_time))).scalars().all()
+    return {"shifts": [_roster_out(r) for r in rows]}
+
+
+@app.post("/api/shift-roster")
+async def create_shift(request: Request, current_user: User = Depends(get_current_user_flexible), db: AsyncSession = Depends(get_db)):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    data = await request.json()
+    if not data.get("role_name") or not data.get("start_time") or not data.get("end_time") or not data.get("on_call_user_id"):
+        raise HTTPException(status_code=400, detail="role_name, start_time, end_time and on_call_user_id are required")
+    now = _time.time()
+    r = ShiftRoster(
+        id=str(_uuid.uuid4()), organization_id=data.get("organization_id"),
+        zone_id=data.get("zone_id"), role_name=data["role_name"],
+        weekdays=data.get("weekdays"), start_time=data["start_time"], end_time=data["end_time"],
+        tz=data.get("tz") or "UTC", on_call_user_id=int(data["on_call_user_id"]),
+        created_at=now, updated_at=now,
+    )
+    db.add(r)
+    await db.commit()
+    await db.refresh(r)
+    return _roster_out(r)
+
+
+@app.put("/api/shift-roster/{shift_id}")
+async def update_shift(shift_id: str, request: Request, current_user: User = Depends(get_current_user_flexible), db: AsyncSession = Depends(get_db)):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    data = await request.json()
+    r = (await db.execute(select(ShiftRoster).where(ShiftRoster.id == shift_id))).scalars().first()
+    if not r:
+        raise HTTPException(status_code=404, detail="shift not found")
+    for f in ("zone_id", "role_name", "weekdays", "start_time", "end_time", "tz"):
+        if f in data:
+            setattr(r, f, data[f])
+    if "on_call_user_id" in data and data["on_call_user_id"]:
+        r.on_call_user_id = int(data["on_call_user_id"])
+    r.updated_at = _time.time()
+    await db.commit()
+    await db.refresh(r)
+    return _roster_out(r)
+
+
+@app.delete("/api/shift-roster/{shift_id}")
+async def delete_shift(shift_id: str, current_user: User = Depends(get_current_user_flexible), db: AsyncSession = Depends(get_db)):
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin only")
+    await db.execute(delete(ShiftRoster).where(ShiftRoster.id == shift_id))
+    await db.commit()
+    return {"message": "deleted", "id": shift_id}
 
 
 @app.get("/api/escalation-policies")
