@@ -1167,6 +1167,19 @@ async def test_fire_policy(
     return {"policy_id": policy_id, "policy_name": p.name, "levels": out_levels}
 
 
+def _wildcard_ilike_pattern(term: Optional[str]) -> Optional[str]:
+    """Translate a user search term into a Postgres ILIKE pattern (clause 44.0
+    wildcards): `*`→`%` (any run), `?`→`_` (any char). Existing %/_/\\ in the
+    term are escaped so they stay literal; a term with no wildcard is treated as
+    a substring (%term%). Returns None for empty. Use with .ilike(pat, escape='\\\\')."""
+    if not term or not term.strip():
+        return None
+    t = term.strip().replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+    if '*' in term or '?' in term:
+        return t.replace('*', '%').replace('?', '_')
+    return f'%{t}%'
+
+
 @app.get("/api/tickets")
 async def list_tickets(
     current_user: User = Depends(get_current_user_flexible),
@@ -1178,6 +1191,7 @@ async def list_tickets(
     assigned_to: Optional[int] = Query(None, description="Filter by assigned user"),
     alarm_type: Optional[str] = Query(None, description="Filter by alarm type"),
     alarms_only: Optional[bool] = Query(None, description="Only alarm tickets (alarm_type set)"),
+    search: Optional[str] = Query(None, description="Wildcard search (*, ?) over ticket #, title, description, alarm type"),
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0)
 ):
@@ -1211,6 +1225,15 @@ async def list_tickets(
             filters.append(Ticket.alarm_type == alarm_type)
         elif alarms_only:
             filters.append(Ticket.alarm_type.is_not(None))
+        # Advanced/wildcard search (clause 44.0) over the ticket's text metadata.
+        _pat = _wildcard_ilike_pattern(search)
+        if _pat:
+            filters.append(or_(
+                Ticket.ticket_number.ilike(_pat, escape='\\'),
+                Ticket.title.ilike(_pat, escape='\\'),
+                Ticket.description.ilike(_pat, escape='\\'),
+                Ticket.alarm_type.ilike(_pat, escape='\\'),
+            ))
 
         if filters:
             query = query.where(and_(*filters))
