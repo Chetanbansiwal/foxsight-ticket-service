@@ -1331,10 +1331,15 @@ async def get_ticket_stats(
             result = await db.execute(_scope(query))
             status_counts[status] = result.scalar()
 
-        # Count by severity
+        # Count by severity — case-insensitively. Stored severities are
+        # mixed-case across producers ('MEDIUM' from the rule engine, 'high'
+        # from event-management) and the standing decision is to NORMALIZE AT
+        # READ, never rewrite stored values (WS2 preference matching keys on
+        # them). Exact-match counting silently reported medium: 0 while 63
+        # MEDIUM tickets sat in the list.
         severity_counts = {}
         for severity in ['critical', 'high', 'medium', 'low', 'info']:
-            query = select(func.count()).select_from(Ticket).where(Ticket.severity == severity)
+            query = select(func.count()).select_from(Ticket).where(func.lower(Ticket.severity) == severity)
             if filters:
                 query = query.where(and_(*filters))
             result = await db.execute(_scope(query))
