@@ -13,7 +13,7 @@ import time as _time
 from datetime import datetime
 from fastapi import FastAPI, HTTPException, Depends, Request, Query
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, or_, update, func, text, delete
+from sqlalchemy import select, and_, or_, update, func, text, delete, case
 from sqlalchemy.orm import selectinload
 import structlog
 
@@ -1193,7 +1193,9 @@ async def list_tickets(
     alarms_only: Optional[bool] = Query(None, description="Only alarm tickets (alarm_type set)"),
     search: Optional[str] = Query(None, description="Wildcard search (*, ?) over ticket #, title, description, alarm type"),
     limit: int = Query(100, le=500),
-    offset: int = Query(0, ge=0)
+    offset: int = Query(0, ge=0),
+    sort_by: Optional[str] = Query(None, description="created_at | severity | status | camera | title | ticket_number"),
+    sort_order: Optional[str] = Query(None, description="asc | desc (default desc)")
 ):
     """
     List tickets with optional filters.
@@ -1238,8 +1240,29 @@ async def list_tickets(
         if filters:
             query = query.where(and_(*filters))
 
-        # Order by created_at descending
-        query = query.order_by(Ticket.created_at.desc())
+        # Sortable columns (allowlisted — sort_by/sort_order were accepted but
+        # silently ignored before). Severity sorts by RANK via a CASE over the
+        # lowercased value: alphabetical order would put CRITICAL < HIGH < LOW
+        # < MEDIUM, and stored casing is mixed across producers.
+        _severity_rank = case(
+            (func.lower(Ticket.severity) == 'critical', 0),
+            (func.lower(Ticket.severity) == 'high', 1),
+            (func.lower(Ticket.severity) == 'medium', 2),
+            (func.lower(Ticket.severity) == 'low', 3),
+            else_=4,
+        )
+        _sort_cols = {
+            'created_at': Ticket.created_at,
+            'severity': _severity_rank,
+            'status': func.lower(Ticket.status),
+            'camera': Ticket.camera_id,   # no camera_name column; name is enriched at response time
+            'title': func.lower(Ticket.title),
+            'ticket_number': Ticket.ticket_number,
+        }
+        _col = _sort_cols.get(sort_by or 'created_at', Ticket.created_at)
+        _primary = _col.asc() if (sort_order or 'desc').lower() == 'asc' else _col.desc()
+        # created_at as a stable tiebreaker so equal-key pages don't shuffle.
+        query = query.order_by(_primary, Ticket.created_at.desc())
 
         # Get total count
         count_query = select(func.count()).select_from(Ticket)
