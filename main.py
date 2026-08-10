@@ -28,6 +28,7 @@ from models import (
 )
 import json
 import uuid as _uuid
+from types import SimpleNamespace
 from auth import get_current_user_flexible, get_user_from_headers
 from zone_scoping import resolve_user_zone_ids, scope_by_camera_id
 
@@ -989,6 +990,54 @@ async def delete_shift(shift_id: str, current_user: User = Depends(get_current_u
     await db.execute(delete(ShiftRoster).where(ShiftRoster.id == shift_id))
     await db.commit()
     return {"message": "deleted", "id": shift_id}
+
+
+@app.post("/api/escalation-policies/preview")
+async def preview_escalation_match(
+    request: Request,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db)
+):
+    """Which policy would escalate an alarm of this shape, and who it reaches.
+
+    Answers the question a rule author actually has — "if this fires, does
+    anyone get told?" — before the rule is saved, rather than after the first
+    real incident goes unanswered. Deliberately runs the SAME _match_policy the
+    escalation engine runs: a preview that reimplements the matching would
+    eventually disagree with it, which is worse than no preview.
+
+    Body: {severity, camera_id?, alarm_type?, organization_id?}
+    """
+    data = await request.json()
+
+    # A detached stand-in, not a persisted row: this must not create anything.
+    # _match_policy only reads these four attributes.
+    probe = SimpleNamespace(
+        organization_id=data.get("organization_id"),
+        camera_id=data.get("camera_id"),
+        alarm_type=data.get("alarm_type"),
+        severity=data.get("severity"),
+    )
+
+    total = (await db.execute(select(func.count()).select_from(EscalationPolicy))).scalar() or 0
+    enabled = (await db.execute(select(func.count()).select_from(EscalationPolicy)
+                                .where(EscalationPolicy.enabled == True))).scalar() or 0
+
+    p = await _match_policy(db, probe)
+    if not p:
+        # Say WHY nothing matched — "no policy" and "policies exist but none
+        # covers this" need completely different fixes from the operator.
+        if total == 0:
+            reason = "no_policies"
+        elif enabled == 0:
+            reason = "all_disabled"
+        else:
+            reason = "no_match"
+        return {"matched": False, "reason": reason,
+                "policy_count": total, "enabled_count": enabled}
+
+    return {"matched": True, "reason": "matched", "policy": await _load_policy_tree(db, p),
+            "policy_count": total, "enabled_count": enabled}
 
 
 @app.get("/api/escalation-policies")
