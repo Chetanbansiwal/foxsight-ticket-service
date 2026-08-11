@@ -1243,8 +1243,9 @@ async def list_tickets(
     search: Optional[str] = Query(None, description="Wildcard search (*, ?) over ticket #, title, description, alarm type"),
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
-    sort_by: Optional[str] = Query(None, description="created_at | severity | status | camera | title | ticket_number"),
-    sort_order: Optional[str] = Query(None, description="asc | desc (default desc)")
+    sort_by: Optional[str] = Query(None, description="created_at | updated_at | severity | status | camera | title | ticket_number"),
+    sort_order: Optional[str] = Query(None, description="asc | desc (default desc)"),
+    pin_latched: bool = Query(True, description="Clause 50.2: order still-asserted, unacknowledged latched alarms first, before the chosen sort. Pass false for a pure sort.")
 ):
     """
     List tickets with optional filters.
@@ -1302,16 +1303,62 @@ async def list_tickets(
         )
         _sort_cols = {
             'created_at': Ticket.created_at,
+            # Last activity. A LATCHED alarm keeps one ticket and re-raises
+            # onto it, so created_at is when the alarm was first ever seen —
+            # not when it last fired. Without this, an intrusion firing right
+            # now sits wherever it was created, which for a long-lived latched
+            # ticket is far down the list, below alarms quiet for days.
+            # Observed 2026-08-11: ticket 140eb5d4 (created 07-31) updated by a
+            # live intrusion and absent from the newest-12 by created_at.
+            # The client's own TicketFilters type already listed 'updated_at';
+            # only this allowlist was missing, so the parameter was accepted
+            # and silently downgraded to created_at.
+            'updated_at': Ticket.updated_at,
             'severity': _severity_rank,
             'status': func.lower(Ticket.status),
             'camera': Ticket.camera_id,   # no camera_name column; name is enriched at response time
             'title': func.lower(Ticket.title),
             'ticket_number': Ticket.ticket_number,
         }
+        # Unknown values still fall back rather than 400, so a stale saved view
+        # keeps working — but the fallback is no longer silent. Being quietly
+        # ignored is how 'updated_at' looked supported for so long.
+        if sort_by and sort_by not in _sort_cols:
+            logger.warning("Unsupported sort_by ignored; falling back to created_at",
+                           sort_by=sort_by, supported=sorted(_sort_cols))
         _col = _sort_cols.get(sort_by or 'created_at', Ticket.created_at)
         _primary = _col.asc() if (sort_order or 'desc').lower() == 'asc' else _col.desc()
+
+        # Clause 50.2 — a latched alarm that is still asserted and
+        # unacknowledged comes first, whatever the chosen sort.
+        #
+        # The web client already floats these to the top, but it can only
+        # reorder the page the server sent, and the server pages by the sort
+        # column. A latched ticket is created once and re-raised onto forever,
+        # so its created_at is when the alarm was FIRST seen: an intrusion
+        # firing right now can sit on page 4 and never reach the client's
+        # reordering at all. Observed 2026-08-11 — ticket 140eb5d4, created
+        # 07-31, updated by a live intrusion, absent from the newest 12.
+        #
+        # A parameter rather than baked-in behaviour: it defaults to the
+        # compliance requirement, and a caller that wants an unmodified sort
+        # (exports, reports) passes pin_latched=false. The operator's own sort
+        # choice is preserved as the secondary key either way — this changes
+        # what reaches page 1, not how the rest is ordered.
+        _order = []
+        if pin_latched:
+            _order.append(
+                case(
+                    (and_(Ticket.is_latched.is_(True),
+                          Ticket.acknowledged_at.is_(None),
+                          func.lower(Ticket.status).in_(("open", "assigned", "in_progress"))), 0),
+                    else_=1,
+                ).asc()
+            )
+        _order.append(_primary)
         # created_at as a stable tiebreaker so equal-key pages don't shuffle.
-        query = query.order_by(_primary, Ticket.created_at.desc())
+        _order.append(Ticket.created_at.desc())
+        query = query.order_by(*_order)
 
         # Get total count
         count_query = select(func.count()).select_from(Ticket)
