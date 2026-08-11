@@ -675,6 +675,15 @@ async def upsert_alarm(
             if not existing:
                 return {"message": "no active alarm to clear", "created": False}
             await _link(existing.id)
+            # Point the ticket at the LATEST occurrence, not the first.
+            #
+            # Only the link table was updated here, so primary_event_id stayed
+            # pinned to whatever fired first. On a latched alarm that can be
+            # months back: TKT-1785688251-69105db0 was created 2 August and
+            # re-raised on the 11th, and its evidence clip resolved against the
+            # 2 August event whose footage had long since aged out. The clip
+            # must follow the occurrence the operator is looking at.
+            existing.primary_event_id = event_id
             existing.latch_cleared_at = now
             existing.updated_at = now
             # If someone already responded, the alarm is fully done once the
@@ -1420,6 +1429,12 @@ async def list_tickets(
                     "alarm_type": t.alarm_type,
                     "is_latched": t.is_latched,
                     "acknowledged_at": t.acknowledged_at,
+                    # The occurrence this ticket currently points at. Named
+                    # event_id because that is what every consumer already asks
+                    # for — the column is primary_event_id, and the list simply
+                    # never emitted it, so the evidence clip had nothing to
+                    # resolve against and every ticket looked eventless.
+                    "event_id": t.primary_event_id,
                 }
                 for t in tickets
             ],
