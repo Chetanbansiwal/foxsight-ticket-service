@@ -1347,13 +1347,30 @@ async def list_tickets(
         # what reaches page 1, not how the rest is ordered.
         _order = []
         if pin_latched:
+            _active_latched = and_(
+                Ticket.is_latched.is_(True),
+                Ticket.acknowledged_at.is_(None),
+                func.lower(Ticket.status).in_(("open", "assigned", "in_progress")),
+            )
+            _order.append(case((_active_latched, 0), else_=1).asc())
+            # Within the pinned group, most-recently-asserted first — NOT the
+            # chosen sort. 50.2 is about seeing what is wrong *now*, and a
+            # latched ticket's created_at is when the alarm was first ever
+            # seen. Ranking the pinned group by created_at (the first version
+            # of this fix) simply reproduced the bug one level in: with 20+
+            # latched alarms, one firing this minute but created weeks ago
+            # still fell off page 1. Verified: ticket 140eb5d4 stayed off it.
+            # Non-pinned rows get 0 here and fall through to the operator's own
+            # sort untouched. Deliberately 0 rather than NULL: NULL ordering
+            # under DESC is dialect-dependent (Postgres puts NULLs first, which
+            # would rank a latched row with no updated_at above live ones), and
+            # `.nullslast()` vs `.nulls_last()` moved between SQLAlchemy
+            # versions — a runtime AttributeError here would break the entire
+            # ticket list. coalesce keeps a never-updated latched row ranked by
+            # its creation instead of vanishing to the bottom.
             _order.append(
-                case(
-                    (and_(Ticket.is_latched.is_(True),
-                          Ticket.acknowledged_at.is_(None),
-                          func.lower(Ticket.status).in_(("open", "assigned", "in_progress"))), 0),
-                    else_=1,
-                ).asc()
+                case((_active_latched, func.coalesce(Ticket.updated_at, Ticket.created_at)),
+                     else_=0.0).desc()
             )
         _order.append(_primary)
         # created_at as a stable tiebreaker so equal-key pages don't shuffle.
