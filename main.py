@@ -49,7 +49,20 @@ async def _ensure_alarm_schema():
                     ADD COLUMN IF NOT EXISTS alarm_type       VARCHAR(50),
                     ADD COLUMN IF NOT EXISTS primary_event_id INTEGER,
                     ADD COLUMN IF NOT EXISTS is_latched       BOOLEAN DEFAULT FALSE,
-                    ADD COLUMN IF NOT EXISTS latch_cleared_at DOUBLE PRECISION
+                    ADD COLUMN IF NOT EXISTS latch_cleared_at DOUBLE PRECISION,
+                    ADD COLUMN IF NOT EXISTS last_occurred_at DOUBLE PRECISION
+            """))
+            # Backfill: existing rows have no occurrence stamp, and a NULL would
+            # send consumers straight back to created_at — the bug this column
+            # exists to end. The newest linked event is the best evidence we
+            # have of when each alarm last fired; tickets with no links fall
+            # back to their own created_at.
+            await s.execute(text("""
+                UPDATE tickets t SET last_occurred_at = COALESCE(
+                    (SELECT MAX(l.created_at) FROM alarm_event_link l
+                      WHERE l.ticket_id = t.id),
+                    t.created_at)
+                WHERE t.last_occurred_at IS NULL AND t.alarm_type IS NOT NULL
             """))
             await s.execute(text("ALTER TABLE tickets ALTER COLUMN camera_id DROP NOT NULL"))
             await s.execute(text("ALTER TABLE tickets ALTER COLUMN provider_id DROP NOT NULL"))
@@ -582,7 +595,9 @@ async def create_ticket(
             video_clip_url=json_data.get('video_clip_url'),
             detection_count=json_data.get('detection_count', 0),
             created_at=_time.time(),
-            updated_at=_time.time()
+            updated_at=_time.time(),
+            # First fire IS the latest fire at creation time.
+            last_occurred_at=_time.time()
         )
 
         db.add(ticket)
@@ -705,6 +720,11 @@ async def upsert_alarm(
             await _link(existing.id)
             existing.detection_count = (existing.detection_count or 0) + 1
             existing.updated_at = now
+            # The alarm fired again NOW. Without this the ticket's only time
+            # signal for consumers is created_at — the first-ever fire, which
+            # on a latched alarm can be weeks back and whose footage is gone.
+            existing.last_occurred_at = now
+            existing.primary_event_id = event_id
             await db.commit()
             return {"message": "deduped into existing alarm", "ticket_id": existing.id,
                     "status": existing.status, "created": False}
@@ -722,6 +742,7 @@ async def upsert_alarm(
             organization_id=data.get('organization_id'),
             alarm_type=alarm_type,
             primary_event_id=event_id,
+            last_occurred_at=now,
             is_latched=bool(data.get('latch', True)),
             alert_data=data.get('alert_data'),
             detection_count=1,
@@ -1435,6 +1456,10 @@ async def list_tickets(
                     # never emitted it, so the evidence clip had nothing to
                     # resolve against and every ticket looked eventless.
                     "event_id": t.primary_event_id,
+                    # When the alarm LAST fired. Distinct from created_at (the
+                    # first ever fire) and updated_at (any edit, incl. comments
+                    # and status changes). The evidence clip must key off this.
+                    "last_occurred_at": t.last_occurred_at or t.created_at,
                 }
                 for t in tickets
             ],
@@ -1588,6 +1613,7 @@ async def get_ticket_report(
             "id": ticket.id, "ticket_number": ticket.ticket_number, "title": ticket.title,
             "description": ticket.description, "severity": ticket.severity, "status": ticket.status,
             "alarm_type": ticket.alarm_type, "is_latched": ticket.is_latched,
+            "last_occurred_at": ticket.last_occurred_at or ticket.created_at,
             "created_at": ticket.created_at, "resolved_at": ticket.resolved_at,
             "assigned_to": who(ticket.assigned_to_user_id) if ticket.assigned_to_user_id else None,
             "acknowledged_at": ticket.acknowledged_at, "acknowledged_by": who(ticket.acknowledged_by) if ticket.acknowledged_by else None,
@@ -1665,6 +1691,11 @@ async def get_ticket(
             "resolution_time_seconds": ticket.resolution_time_seconds,
             "created_at": ticket.created_at if ticket.created_at else None,
             "updated_at": ticket.updated_at if ticket.updated_at else None,
+            # When the alarm LAST fired — what the evidence clip must key off.
+            # created_at is the first-ever fire (weeks back on a latched alarm,
+            # with its footage long deleted); updated_at also moves for comments
+            # and status changes, so it is not a substitute.
+            "last_occurred_at": ticket.last_occurred_at or ticket.created_at,
             "comments": [
                 {
                     "id": c.id,
