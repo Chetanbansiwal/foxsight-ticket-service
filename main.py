@@ -126,6 +126,22 @@ def _stamp_ack(ticket, user_id, now):
     ticket.updated_at = now
 
 
+def _status_note(json_data):
+    """The operator's note for a status change, under either spelling.
+
+    The web client has always sent `reason` (resolveTicket / closeTicket both
+    take one), while this endpoint only ever read `comment` — so the stated
+    reason for resolving or closing a ticket was accepted and silently dropped.
+    `reason` wins because it is the live caller. Blank or whitespace-only text
+    counts as absent rather than becoming an empty comment.
+    """
+    note = json_data.get('reason') or json_data.get('comment')
+    if note is None:
+        return None
+    text = str(note).strip()
+    return text or None
+
+
 async def _alarm_zone_path(db, ticket):
     """Materialized-path of the alarm's zone (via camera). None if camera-less/unzoned."""
     if ticket.camera_id is None:
@@ -1737,8 +1753,14 @@ async def update_ticket_status(
     Body:
     {
         "status": "assigned|in_progress|resolved|closed|false_positive",
-        "comment": "Optional comment"
+        "reason": "Optional note recorded as a comment",
+        "comment": "Accepted as an alias for `reason`"
     }
+
+    `reason` is what the web client has always sent (resolveTicket / closeTicket
+    both take one); this endpoint only ever read `comment`, so an operator's
+    stated reason for resolving or closing was accepted and silently dropped.
+    Both spellings are read now — `reason` first, since that is the live caller.
     """
     try:
         json_data = await request.json()
@@ -1789,13 +1811,14 @@ async def update_ticket_status(
         )
         db.add(state_history)
 
-        # Add comment if provided
-        if json_data.get('comment'):
+        # Record the operator's note, under either spelling (see _status_note).
+        note = _status_note(json_data)
+        if note:
             comment = TicketComment(
                 id=str(uuid.uuid4()),
                 ticket_id=ticket.id,
                 user_id=current_user.id,
-                comment_text=json_data['comment'],
+                comment_text=note,
                 is_internal=json_data.get('is_internal', False),
                 created_at=_time.time()
             )
