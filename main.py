@@ -121,7 +121,18 @@ _SEV_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 # `webhook` ACTION is the real feature and is wired separately
 # (_run_response_action). Anything not in this set is dropped at write time so
 # a stale client cannot re-introduce a silent black hole.
-VALID_CHANNELS = ("push", "email", "sms", "whatsapp")
+#
+# In-app delivery is TWO channels, not one. A toast and a full-screen popup are
+# different demands on an operator — "know this" versus "deal with this now" —
+# and which one an alarm deserves is a property of the policy, not of a severity
+# string typed into a rule somewhere. Splitting them is what makes the choice
+# configurable in the matrix.
+VALID_CHANNELS = ("toast", "popup", "email", "sms", "whatsapp")
+# `push` was the single in-app channel before the split. Existing policies still
+# hold it, so it maps to the behaviour those policies actually had: a targeted
+# escalation commanded the screen.
+LEGACY_CHANNEL_ALIASES = {"push": "popup"}
+IN_APP_CHANNELS = ("toast", "popup")
 # Channels whose out-of-band sender is not integrated yet. They are accepted and
 # logged so the audit trail is honest about what was asked for, but the UI must
 # not offer them as if they deliver. See _dispatch_one in user-management.
@@ -130,14 +141,15 @@ UNWIRED_CHANNELS = ("sms", "whatsapp")
 
 def _clean_channels(raw) -> list:
     """Normalize a recipient's channel list: known channels only, order-stable,
-    de-duplicated, and never empty (in-app push is the floor — a recipient with
-    no channel at all would be a row that notifies nobody)."""
+    de-duplicated, and never empty (a full-screen popup is the floor — a
+    recipient with no channel at all would be a row that notifies nobody)."""
     out = []
     for c in (raw or []):
         c = str(c).strip().lower()
+        c = LEGACY_CHANNEL_ALIASES.get(c, c)
         if c in VALID_CHANNELS and c not in out:
             out.append(c)
-    return out or ["push"]
+    return out or ["popup"]
 
 
 def _stamp_ack(ticket, user_id, now):
@@ -348,15 +360,18 @@ async def _fire_level(db, ticket, level, now):
     recips = (await db.execute(
         select(EscalationRecipient).where(EscalationRecipient.level_id == level.id))).scalars().all()
     notified = set()
-    # Who asked for the IN-APP channel specifically.
+    # Who asked for which IN-APP presentation.
     #
-    # This used to be `notified` — every resolved recipient — so the Redis
-    # publish below went out to everyone the level named regardless of which
-    # channels were ticked. Un-ticking "push" changed the notification_logs
-    # rows and nothing else: the operator still got the toast. The channel
-    # picker looked like a control over delivery and was, for the only channel
-    # that actually delivered, decoration.
-    push_targets = set()
+    # These used to be one set built from `notified` — every resolved recipient
+    # — so the Redis publish went out to everyone the level named regardless of
+    # which channels were ticked. Un-ticking in-app changed the
+    # notification_logs rows and nothing else: the operator still got the
+    # toast. The channel picker looked like a control over delivery and was,
+    # for the only channel that actually delivered, decoration.
+    #
+    # They are kept apart because the matrix now decides HOW a recipient is
+    # interrupted, not just whether.
+    toast_targets, popup_targets = set(), set()
     for r in recips:
         users = []
         if r.recipient_type == "zone_role" and r.role_id:
@@ -371,13 +386,19 @@ async def _fire_level(db, ticket, level, now):
         channels = _clean_channels(r.channels)
         for u in users:
             for ch in channels:
+                in_app = ch in IN_APP_CHANNELS
                 db.add(NotificationLog(
                     id=str(_uuid.uuid4()), ticket_id=ticket.id, user_id=u.id,
                     channel_type=ch, template_name="escalation",
-                    status=("sent" if ch == "push" else "pending"),
-                    sent_at=(now if ch == "push" else None), created_at=now))
-            if "push" in channels:
-                push_targets.add(u.id)
+                    status=("sent" if in_app else "pending"),
+                    sent_at=(now if in_app else None), created_at=now))
+            if "popup" in channels:
+                popup_targets.add(u.id)
+            # A recipient who asked for both gets the popup only — it already
+            # contains everything the toast would say, and stacking a toast
+            # behind a full-screen popup for the same alarm is just noise.
+            elif "toast" in channels:
+                toast_targets.add(u.id)
             notified.add(u.id)
 
     for a in (await db.execute(
@@ -395,13 +416,21 @@ async def _fire_level(db, ticket, level, now):
         try:
             r = await get_redis()
             await r.publish(NOTIFY_USER_CHANNEL, json.dumps({
-                # Only the people who asked for in-app get the addressed copy…
-                "user_ids": sorted(push_targets),
-                # …but the room-wide "an escalation is running" copy is about
+                # Addressed by presentation — the matrix decided which.
+                "popup_user_ids": sorted(popup_targets),
+                "toast_user_ids": sorted(toast_targets),
+                # Kept for a mixed-version window: an older event-management
+                # still reads `user_ids` and will at least reach the people who
+                # asked to be interrupted.
+                "user_ids": sorted(popup_targets),
+                # The room-wide "an escalation is running" copy is about
                 # awareness, not delivery, so it counts everyone the level
                 # named. An email-only level still has to be visible to whoever
-                # is actually sitting in the control room.
+                # is actually sitting in the control room — and that copy is
+                # zone-filtered by camera_id below, so it does NOT go to
+                # operators who cannot see this camera.
                 "recipient_count": len(notified),
+                "camera_id": ticket.camera_id,
                 "ticket_id": ticket.id, "ticket_number": ticket.ticket_number,
                 "title": ticket.title, "severity": ticket.severity,
                 "level": ticket.escalation_level, "alarm_type": ticket.alarm_type,

@@ -31,7 +31,8 @@ _TREE = ast.parse(_SRC)
 
 # main.py imports FastAPI/SQLAlchemy/redis — absent outside the service image.
 # Lift the pure pieces so this exercises the SHIPPED source, not a copy.
-_WANTED = ("VALID_CHANNELS", "UNWIRED_CHANNELS", "_clean_channels")
+_WANTED = ("VALID_CHANNELS", "UNWIRED_CHANNELS", "IN_APP_CHANNELS",
+           "LEGACY_CHANNEL_ALIASES", "_clean_channels")
 _body = [n for n in _TREE.body
          if (isinstance(n, ast.FunctionDef) and n.name in _WANTED)
          or (isinstance(n, ast.Assign)
@@ -44,6 +45,7 @@ exec(compile(_mod, "main.py", "exec"), _ns)
 clean = _ns.get("_clean_channels")
 VALID_CHANNELS = _ns.get("VALID_CHANNELS")
 UNWIRED_CHANNELS = _ns.get("UNWIRED_CHANNELS")
+IN_APP_CHANNELS = _ns.get("IN_APP_CHANNELS")
 
 FAILURES = []
 
@@ -68,41 +70,60 @@ def main():
 
     print("channel vocabulary")
     check("webhook is not a channel", "webhook" in VALID_CHANNELS, False)
-    check("the four offered channels", sorted(VALID_CHANNELS),
-          ["email", "push", "sms", "whatsapp"])
+    check("the five offered channels", sorted(VALID_CHANNELS),
+          ["email", "popup", "sms", "toast", "whatsapp"])
+    check("in-app is two distinct presentations", sorted(IN_APP_CHANNELS),
+          ["popup", "toast"])
+    # `push` is no longer a channel in its own right — it is what old policies
+    # hold, and it must keep meaning what it did: a popup.
+    check("push is not offered", "push" in VALID_CHANNELS, False)
     check("sms/whatsapp declared unwired", sorted(UNWIRED_CHANNELS), ["sms", "whatsapp"])
 
     print("\n_clean_channels")
-    check("drops webhook", clean(["push", "webhook"]), ["push"])
-    check("drops anything unknown", clean(["push", "carrier-pigeon"]), ["push"])
-    check("keeps order as given", clean(["email", "push"]), ["email", "push"])
-    check("de-duplicates", clean(["push", "push", "email"]), ["push", "email"])
-    check("normalizes case and spacing", clean([" Email ", "PUSH"]), ["email", "push"])
+    check("drops webhook", clean(["toast", "webhook"]), ["toast"])
+    check("drops anything unknown", clean(["toast", "carrier-pigeon"]), ["toast"])
+    check("keeps order as given", clean(["email", "toast"]), ["email", "toast"])
+    check("de-duplicates", clean(["toast", "toast", "email"]), ["toast", "email"])
+    check("normalizes case and spacing", clean([" Email ", "TOAST"]), ["email", "toast"])
+    # Legacy migration: a stored `push` must keep behaving as it did.
+    check("legacy push becomes popup", clean(["push"]), ["popup"])
+    check("legacy push de-dupes against popup", clean(["push", "popup"]), ["popup"])
+    check("toast and popup can coexist", clean(["toast", "popup"]), ["toast", "popup"])
     # A recipient whose only channel was webhook would otherwise end up with an
     # EMPTY list — a row that notifies nobody while still looking configured.
-    check("webhook-only falls back to in-app", clean(["webhook"]), ["push"])
-    check("empty falls back to in-app", clean([]), ["push"])
-    check("None falls back to in-app", clean(None), ["push"])
+    check("webhook-only falls back to in-app", clean(["webhook"]), ["popup"])
+    check("empty falls back to in-app", clean([]), ["popup"])
+    check("None falls back to in-app", clean(None), ["popup"])
     check("sms is accepted (stored, not yet delivered)", clean(["sms"]), ["sms"])
     check("whatsapp is accepted", clean(["whatsapp"]), ["whatsapp"])
 
     print("\npush routing in _fire_level")
     src = fire_level_source()
     # The addressed copy must go to the push-only set...
-    check("publish addresses push_targets",
-          bool(re.search(r'"user_ids":\s*sorted\(push_targets\)', src)), True)
-    check("push_targets is gated on the channel",
-          bool(re.search(r'if\s+"push"\s+in\s+channels', src)), True)
+    check("popup list is addressed",
+          bool(re.search(r'"popup_user_ids":\s*sorted\(popup_targets\)', src)), True)
+    check("toast list is addressed",
+          bool(re.search(r'"toast_user_ids":\s*sorted\(toast_targets\)', src)), True)
+    check("popup is gated on the channel",
+          bool(re.search(r'if\s+"popup"\s+in\s+channels', src)), True)
+    check("toast is gated on the channel",
+          bool(re.search(r'elif\s+"toast"\s+in\s+channels', src)), True)
     check("no longer publishes to every recipient",
           bool(re.search(r'"user_ids":\s*sorted\(notified\)', src)), False)
+    # The ambient copy is zone-filtered downstream by camera_id; without it the
+    # payload reads as system-wide and reaches operators who cannot see the camera.
+    check("camera_id is published for zone filtering",
+          bool(re.search(r'"camera_id":\s*ticket\.camera_id', src)), True)
     # ...while the room-wide awareness copy still counts everyone.
     check("recipient_count counts all recipients",
           bool(re.search(r'"recipient_count":\s*len\(notified\)', src)), True)
     check("the publish still runs for an email-only level",
           bool(re.search(r'if\s+notified:\s*\n\s*try:', src)), True)
     # Rows are written for every channel; only push is 'sent' at write time.
-    check("only push is marked sent on write",
-          bool(re.search(r'"sent"\s+if\s+ch\s*==\s*"push"\s+else\s+"pending"', src)), True)
+    check("only in-app is marked sent on write",
+          bool(re.search(r'"sent"\s+if\s+in_app\s+else\s+"pending"', src)), True)
+    check("in-app membership decides that",
+          bool(re.search(r'in_app\s*=\s*ch\s+in\s+IN_APP_CHANNELS', src)), True)
     check("recipients are cleaned before use",
           bool(re.search(r"channels\s*=\s*_clean_channels\(r\.channels\)", src)), True)
 
