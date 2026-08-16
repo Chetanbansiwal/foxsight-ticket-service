@@ -113,6 +113,32 @@ NOTIFY_USER_CHANNEL = "notify:user"
 ESCALATION_TICK_SECONDS = int(os.getenv("ESCALATION_TICK_SECONDS", "15"))
 _SEV_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
+# The channels a recipient may be given. `webhook` used to be offered here and
+# was undeliverable by construction: delivery resolves an address from the
+# user's verified NotificationChannel rows, and user-management only ever
+# accepts email/sms/whatsapp/push as a channel type — so a webhook row could
+# never resolve a destination and failed on every single attempt. A per-level
+# `webhook` ACTION is the real feature and is wired separately
+# (_run_response_action). Anything not in this set is dropped at write time so
+# a stale client cannot re-introduce a silent black hole.
+VALID_CHANNELS = ("push", "email", "sms", "whatsapp")
+# Channels whose out-of-band sender is not integrated yet. They are accepted and
+# logged so the audit trail is honest about what was asked for, but the UI must
+# not offer them as if they deliver. See _dispatch_one in user-management.
+UNWIRED_CHANNELS = ("sms", "whatsapp")
+
+
+def _clean_channels(raw) -> list:
+    """Normalize a recipient's channel list: known channels only, order-stable,
+    de-duplicated, and never empty (in-app push is the floor — a recipient with
+    no channel at all would be a row that notifies nobody)."""
+    out = []
+    for c in (raw or []):
+        c = str(c).strip().lower()
+        if c in VALID_CHANNELS and c not in out:
+            out.append(c)
+    return out or ["push"]
+
 
 def _stamp_ack(ticket, user_id, now):
     """First response / acknowledge stamps (WS1) — also HALTS escalation. Idempotent."""
@@ -322,6 +348,15 @@ async def _fire_level(db, ticket, level, now):
     recips = (await db.execute(
         select(EscalationRecipient).where(EscalationRecipient.level_id == level.id))).scalars().all()
     notified = set()
+    # Who asked for the IN-APP channel specifically.
+    #
+    # This used to be `notified` — every resolved recipient — so the Redis
+    # publish below went out to everyone the level named regardless of which
+    # channels were ticked. Un-ticking "push" changed the notification_logs
+    # rows and nothing else: the operator still got the toast. The channel
+    # picker looked like a control over delivery and was, for the only channel
+    # that actually delivered, decoration.
+    push_targets = set()
     for r in recips:
         users = []
         if r.recipient_type == "zone_role" and r.role_id:
@@ -330,8 +365,10 @@ async def _fire_level(db, ticket, level, now):
             u = (await db.execute(select(User).where(User.id == r.user_id))).scalar_one_or_none()
             if u:
                 users = [u]
-        # 'external' recipients need WS2 senders — skipped for now.
-        channels = r.channels or ["push"]
+        # 'external' recipients (a bare address, no user row) have no delivery
+        # path: notification_logs.user_id is NOT NULL, so there is nowhere to
+        # record the attempt. Skipped — and no longer offered by the UI.
+        channels = _clean_channels(r.channels)
         for u in users:
             for ch in channels:
                 db.add(NotificationLog(
@@ -339,6 +376,8 @@ async def _fire_level(db, ticket, level, now):
                     channel_type=ch, template_name="escalation",
                     status=("sent" if ch == "push" else "pending"),
                     sent_at=(now if ch == "push" else None), created_at=now))
+            if "push" in channels:
+                push_targets.add(u.id)
             notified.add(u.id)
 
     for a in (await db.execute(
@@ -356,7 +395,13 @@ async def _fire_level(db, ticket, level, now):
         try:
             r = await get_redis()
             await r.publish(NOTIFY_USER_CHANNEL, json.dumps({
-                "user_ids": sorted(notified),
+                # Only the people who asked for in-app get the addressed copy…
+                "user_ids": sorted(push_targets),
+                # …but the room-wide "an escalation is running" copy is about
+                # awareness, not delivery, so it counts everyone the level
+                # named. An email-only level still has to be visible to whoever
+                # is actually sitting in the control room.
+                "recipient_count": len(notified),
                 "ticket_id": ticket.id, "ticket_number": ticket.ticket_number,
                 "title": ticket.title, "severity": ticket.severity,
                 "level": ticket.escalation_level, "alarm_type": ticket.alarm_type,
@@ -884,7 +929,8 @@ async def _write_levels(db, policy_id, levels):
         for r in lv.get("recipients", []) or []:
             db.add(EscalationRecipient(id=str(_uuid.uuid4()), level_id=lid,
                    recipient_type=r.get("recipient_type", "zone_role"), role_id=r.get("role_id"),
-                   user_id=r.get("user_id"), external_ref=r.get("external_ref"), channels=r.get("channels")))
+                   user_id=r.get("user_id"), external_ref=r.get("external_ref"),
+                   channels=_clean_channels(r.get("channels"))))
         for a in lv.get("actions", []) or []:
             db.add(EscalationAction(id=str(_uuid.uuid4()), level_id=lid,
                    action_type=a.get("action_type", "notify"), params=a.get("params")))
