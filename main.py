@@ -190,6 +190,78 @@ async def _alarm_zone_path(db, ticket):
     return (await db.execute(select(Zone.path).where(Zone.id == zid))).scalar_one_or_none()
 
 
+# The catch-all pair, seeded once so that EVERY alarm is routed by the matrix.
+#
+# Before this, an alarm matching no policy was presented by a rule hardcoded in
+# the browser: low/medium became a corner toast, high/critical seized the
+# screen. That rule was invisible from the product — nothing in Settings said it
+# existed, and no operator could change it — so the matrix appeared to govern
+# alarm handling while in practice governing only the minority of alarms someone
+# had written a policy for.
+#
+# Seeded as ordinary, editable policies rather than as engine behaviour: the
+# point is that the default is now VISIBLE and can be changed, not that a
+# different constant lives in a different file.
+#
+# Idempotency is keyed on the NAME, which has a deliberate consequence worth
+# knowing: switching a default OFF is respected forever (the row still exists,
+# `enabled` is false, nothing re-enables it), while DELETING one brings it back
+# on the next restart. That asymmetry is the intended one — "no policy matches
+# this alarm" is the state this exists to abolish, and there is a supported way
+# to say "do not do this" that does not involve leaving alarms unrouted.
+_DEFAULT_POLICIES = [
+    {
+        "name": "Default — high & critical alarms",
+        "match_severity": "high",
+        "priority": 1,
+        "channels": ["popup"],
+        "why": "Interrupts whoever can see the camera's zone.",
+    },
+    {
+        "name": "Default — all other alarms",
+        "match_severity": None,
+        "priority": 0,
+        "channels": ["toast"],
+        "why": "A corner toast for whoever can see the camera's zone.",
+    },
+]
+
+
+async def _ensure_default_policies():
+    """Create any missing catch-all policy. Idempotent by name."""
+    try:
+        async with db_manager.get_session() as db:
+            names = [s["name"] for s in _DEFAULT_POLICIES]
+            existing = set((await db.execute(
+                select(EscalationPolicy.name).where(
+                    EscalationPolicy.name.in_(names)))).scalars().all())
+            created = 0
+            for spec in _DEFAULT_POLICIES:
+                if spec["name"] in existing:
+                    continue
+                created += 1
+                pid = str(_uuid.uuid4())
+                db.add(EscalationPolicy(
+                    id=pid, name=spec["name"], organization_id=None, enabled=True,
+                    match_event_types=None, match_severity=spec["match_severity"],
+                    match_zone_id=None, active_window=None, priority=spec["priority"],
+                ))
+                lid = str(_uuid.uuid4())
+                db.add(EscalationLevel(id=lid, policy_id=pid, level_no=1,
+                                       wait_seconds=0, stop_on_ack=True))
+                db.add(EscalationRecipient(
+                    id=str(_uuid.uuid4()), level_id=lid, recipient_type="zone_any",
+                    role_id=None, user_id=None, external_ref=None,
+                    channels=spec["channels"]))
+            if created:
+                await db.commit()
+                logger.info("Default escalation policies seeded", count=created)
+    except Exception as e:
+        # A missing default costs presentation, not delivery — the alarm and its
+        # ticket are unaffected. Never block startup for it.
+        logger.warning("Default policy seed skipped/failed", error=str(e))
+
+
 async def _match_policy(db, ticket):
     """Best enabled escalation policy for a ticket: org (or NULL-org) ∧ event-type
     ∧ min-severity ∧ zone-subtree. Highest priority wins."""
@@ -268,19 +340,18 @@ async def _oncall_user_for(db, ticket, role_name):
     return None
 
 
-async def _recipients_for_role(db, ticket, role_id):
-    """Users holding the given org_role who can see the alarm's zone: global grant,
-    a grant covering the alarm's zone (ancestor-or-self), or NO zone grants at all
-    (treated as unrestricted, mirroring admin scoping). Camera-less alarms → only
-    global/unrestricted holders."""
-    role = (await db.execute(select(OrgRole).where(OrgRole.id == role_id))).scalar_one_or_none()
-    if not role:
+async def _filter_by_zone_access(db, ticket, candidates):
+    """Whichever of `candidates` can see the alarm's zone: a global grant, a grant
+    covering the zone (ancestor-or-self), or NO grants at all (unrestricted,
+    mirroring admin scoping). Camera-less alarms → only global/unrestricted.
+
+    Shared by the role-scoped and zone-scoped recipient resolvers so "who can see
+    this alarm" has exactly one answer. Two copies of this rule is how a policy
+    ends up notifying someone who cannot open the camera it is about.
+    """
+    if not candidates:
         return []
-    role_users = (await db.execute(
-        select(User).where(User.role == role.name, User.is_active == True))).scalars().all()
-    if not role_users:
-        return []
-    uids = [u.id for u in role_users]
+    uids = [u.id for u in candidates]
     alarm_path = await _alarm_zone_path(db, ticket)
     rows = (await db.execute(
         select(UserZoneAccess.user_id, UserZoneAccess.is_global, Zone.path)
@@ -290,7 +361,7 @@ async def _recipients_for_role(db, ticket, role_id):
     for uid, is_global, gpath in rows:
         grants.setdefault(uid, []).append((is_global, gpath))
     out = []
-    for u in role_users:
+    for u in candidates:
         g = grants.get(u.id)
         if not g:
             out.append(u)                                   # no grants → unrestricted
@@ -298,6 +369,33 @@ async def _recipients_for_role(db, ticket, role_id):
             out.append(u)                                   # global grant
         elif alarm_path and any(gp and alarm_path.startswith(gp) for _, gp in g):
             out.append(u)                                   # covers the alarm's zone
+    return out
+
+
+async def _recipients_in_zone(db, ticket):
+    """Everyone active who can see the alarm's zone, whatever role they hold.
+
+    The matrix addresses people by ROLE, which cannot express "whoever is
+    watching this area" — and that is precisely who an ordinary alarm should
+    reach. Without this, routing ordinary alarms through the matrix would
+    require naming every role separately in the default policy and would still
+    miss any role added later.
+    """
+    users = (await db.execute(
+        select(User).where(User.is_active == True))).scalars().all()
+    return await _filter_by_zone_access(db, ticket, users)
+
+
+async def _recipients_for_role(db, ticket, role_id):
+    """Users holding the given org_role who can see the alarm's zone."""
+    role = (await db.execute(select(OrgRole).where(OrgRole.id == role_id))).scalar_one_or_none()
+    if not role:
+        return []
+    role_users = (await db.execute(
+        select(User).where(User.role == role.name, User.is_active == True))).scalars().all()
+    out = await _filter_by_zone_access(db, ticket, role_users)
+    if not out:
+        return []
 
     # WS6 roster: if a shift covers now for this role (+ the alarm's zone),
     # notify the on-call user specifically instead of everyone holding the role.
@@ -374,7 +472,9 @@ async def _fire_level(db, ticket, level, now):
     toast_targets, popup_targets = set(), set()
     for r in recips:
         users = []
-        if r.recipient_type == "zone_role" and r.role_id:
+        if r.recipient_type == "zone_any":
+            users = await _recipients_in_zone(db, ticket)
+        elif r.recipient_type == "zone_role" and r.role_id:
             users = await _recipients_for_role(db, ticket, r.role_id)
         elif r.recipient_type == "user" and r.user_id:
             u = (await db.execute(select(User).where(User.id == r.user_id))).scalar_one_or_none()
@@ -566,6 +666,7 @@ async def lifespan(app: FastAPI):
     await db_manager.initialize()
     await _ensure_alarm_schema()
     await _ensure_escalation_schema()
+    await _ensure_default_policies()
     # WS1: the escalation scheduler — ticket-service's first background worker.
     escalation_task = asyncio.create_task(_escalation_scheduler_loop())
     # WS6: SLA-breach detector.
@@ -1323,7 +1424,11 @@ async def test_fire_policy(
             EscalationRecipient.level_id == l.id))).scalars().all()
         who = []
         for r in recips:
-            if r.recipient_type == "zone_role" and r.role_id:
+            if r.recipient_type == "zone_any":
+                who += [{"user_id": u.id, "username": u.username, "role": u.role,
+                         "channels": r.channels}
+                        for u in await _recipients_in_zone(db, probe)]
+            elif r.recipient_type == "zone_role" and r.role_id:
                 users = await _recipients_for_role(db, probe, r.role_id)
                 who += [{"user_id": u.id, "username": u.username, "role": u.role, "channels": r.channels}
                         for u in users]
