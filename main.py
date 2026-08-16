@@ -11,7 +11,7 @@ from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 import time as _time
 from datetime import datetime
-from fastapi import FastAPI, HTTPException, Depends, Request, Query
+from fastapi import FastAPI, HTTPException, Depends, Request, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, update, func, text, delete, case
 from sqlalchemy.orm import selectinload
@@ -1603,17 +1603,12 @@ async def get_ticket_stats(
         raise HTTPException(status_code=500, detail="Failed to get ticket stats")
 
 
-@app.get("/api/tickets/{ticket_id}/report")
-async def get_ticket_report(
-    ticket_id: str,
-    current_user: User = Depends(get_current_user_flexible),
-    db: AsyncSession = Depends(get_db),
-):
-    """WS5 (clauses 50.9 / 47 / 51): consolidated incident e-report + audit
-    timeline for one ticket — metadata + snapshot/clip refs + comments +
-    escalation fires + notification log, merged into one time-ordered audit that
-    answers who-was-notified / who-ack'd / who-actioned / when. The web-client
-    renders this print-ready (PDF via print) and CSV-exports the timeline."""
+async def _build_report(ticket_id: str, current_user, db):
+    """Assemble the incident report payload.
+
+    Shared by the JSON endpoint and the PDF renderer so the printable evidence
+    document and the on-screen one can never drift apart — two assemblies of
+    "the same" report is exactly how a field silently stops matching."""
     result = await db.execute(
         select(Ticket).where(Ticket.id == ticket_id).options(
             selectinload(Ticket.camera),
@@ -1695,6 +1690,86 @@ async def get_ticket_report(
                           for n in sorted(notifs, key=lambda n: (n.sent_at or n.created_at or 0))],
         "timeline": timeline,
     }
+
+
+@app.get("/api/tickets/{ticket_id}/report")
+async def get_ticket_report(
+    ticket_id: str,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """WS5 (clauses 50.9 / 47 / 51): consolidated incident e-report + audit
+    timeline for one ticket — metadata + snapshot/clip refs + comments +
+    escalation fires + notification log, merged into one time-ordered audit that
+    answers who-was-notified / who-ack'd / who-actioned / when. The web-client
+    renders this print-ready (PDF via print) and CSV-exports the timeline."""
+    return await _build_report(ticket_id, current_user, db)
+
+
+# Where the evidence still comes from. recording-service resolves the wall-clock
+# instant to a recording session and decodes the frame; ticket-service only
+# knows WHEN, so the arithmetic deliberately stays on that side.
+RECORDING_SERVICE_URL = os.getenv("SERVICE_RECORDING_SERVICE_URL", "http://recording-service:8000")
+REPORT_TIMEZONE = os.getenv("REPORT_TIMEZONE", "UTC")
+
+
+async def _evidence_frame(ticket_id: str, camera_id, when_unix):
+    """(jpeg_bytes, note). Never raises — a missing frame must not cost the
+    report, but the reason IS carried through so the document can say why the
+    picture is absent instead of showing an empty box."""
+    if not camera_id:
+        return None, "This incident is not associated with a camera, so no evidence frame exists."
+    if not when_unix:
+        return None, "The incident carries no occurrence time, so no frame could be located."
+    import httpx
+    url = f"{RECORDING_SERVICE_URL}/playback/{camera_id}/frame-at"
+    headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "incident-report"}
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            r = await client.get(url, params={"t": float(when_unix)}, headers=headers)
+        if r.status_code == 200 and r.content:
+            return r.content, ""
+        detail = r.text[:180] if r.text else ""
+        logger.info("Evidence frame unavailable", ticket_id=ticket_id,
+                    camera_id=camera_id, status=r.status_code)
+        return None, ("No recorded footage covers this moment, so no evidence frame could be "
+                      f"extracted (recording service returned {r.status_code}"
+                      f"{': ' + detail if detail else ''}).")
+    except Exception as e:
+        logger.warning("Evidence frame fetch failed", ticket_id=ticket_id, error=str(e))
+        return None, (f"The evidence frame could not be retrieved ({type(e).__name__}). "
+                      "The recording may still exist — retry from the ticket.")
+
+
+@app.get("/api/tickets/{ticket_id}/report.pdf")
+async def get_ticket_report_pdf(
+    ticket_id: str,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """The printable evidence record, rendered server-side (47.0).
+
+    The HTML report needs a browser to become a PDF, which makes it unusable for
+    anything automated — an escalation email cannot open one. This renders the
+    same payload directly, so the document attached to a notification and the
+    one an operator prints are the same record."""
+    report = await _build_report(ticket_id, current_user, db)
+    t = report.get("ticket") or {}
+    cam = report.get("camera") or {}
+    jpeg, note = await _evidence_frame(
+        ticket_id, cam.get("id"), t.get("last_occurred_at") or t.get("created_at"))
+    try:
+        from incident_pdf import build_incident_pdf
+        pdf = build_incident_pdf(report, jpeg, note, REPORT_TIMEZONE)
+    except Exception as e:
+        logger.error("Incident PDF render failed", ticket_id=ticket_id, error=str(e))
+        raise HTTPException(status_code=500, detail="Failed to render incident report")
+    name = f"incident-{t.get('ticket_number') or ticket_id}.pdf"
+    return Response(
+        content=pdf, media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{name}"',
+                 "Content-Length": str(len(pdf))},
+    )
 
 
 @app.get("/api/tickets/{ticket_id}")

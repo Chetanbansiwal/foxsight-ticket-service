@@ -24,3 +24,8 @@ structlog==25.1.0
 
 # Utilities
 python-multipart==0.0.20
+
+# Incident report PDF (clause 47.0) — rendered server-side so an escalation
+# notification can attach the evidence document without a headless browser.
+# Pillow arrives with fpdf2 and is what decodes the evidence JPEG.
+fpdf2==2.8.3
