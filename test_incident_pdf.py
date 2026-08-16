@@ -139,8 +139,29 @@ def main():
         img, "", "UTC")
     check_true("survives non-latin-1 text", uni.startswith(b"%PDF-"))
 
+    print("\ntypography survives latin-1")
+    # The first real PDF off the box read "Assigned to ?", "LATCHED ? still
+    # asserted" and "Escalation L1 fired ? 1 recipient(s)" — every em dash and
+    # arrow had become a literal question mark, which on an evidence document
+    # reads as corruption rather than as a font limitation.
+    check("em dash", _safe("a — b"), "a - b")
+    check("arrow", _safe("open → closed"), "open -> closed")
+    check("middle dot", _safe("a · b"), "a - b")
+    check("curly quotes", _safe("‘x’ “y”"), "'x' \"y\"")
+    check("ellipsis", _safe("wait…"), "wait...")
+    check_true("no stray '?' from our own punctuation",
+               "?" not in _safe("Escalation L1 fired → 2 recipient(s) — done"))
+    # The em-dash placeholder the report uses for "no value" must not become "?".
+    check("the empty-value placeholder", _safe("—"), "-")
+    # Genuinely unrepresentable text still degrades rather than raising.
+    check_true("devanagari still degrades safely", isinstance(_safe("प्रवेश"), str))
+
+    rendered = pdf_text(build_incident_pdf(
+        sample_report(timeline=[{"ts": T0, "kind": "status", "actor": "admin",
+                                 "detail": "open → resolved"}]), img, "", "UTC"))
+    check_true("arrows render in the document", "open -> resolved" in rendered)
+
     print("\nhelpers")
-    check("_safe replaces unencodable chars", _safe("café प्रवेश").encode("latin-1") is not None, True)
     check("_safe handles None", _safe(None), "")
     check("_fmt_ts labels its zone", _fmt_ts(T0, "UTC").endswith("UTC"), True)
     check("_fmt_ts on a missing time", _fmt_ts(None, "UTC"), "—")

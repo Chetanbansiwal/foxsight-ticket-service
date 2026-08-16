@@ -41,17 +41,44 @@ SEV_RGB = {
 }
 
 
+# Typography this codebase uses freely in status strings and audit reasons, none
+# of which survives latin-1. Transliterating FIRST matters: the blanket
+# `errors="replace"` turns every one of them into "?", so a rendered report read
+# "Assigned to ?", "LATCHED ? still asserted" and "Escalation L1 fired ? 1
+# recipient(s)" — which on an evidence document looks like data corruption, not
+# like a font limitation. Observed on the first real PDF off the box.
+_TRANSLIT = {
+    "—": "-",   # em dash
+    "–": "-",   # en dash
+    "―": "-",   # horizontal bar
+    "→": "->",  # rightwards arrow (status transitions)
+    "←": "<-",
+    "·": "-",   # middle dot (separator)
+    "•": "*",   # bullet
+    "‘": "'", "’": "'",
+    "“": '"', "”": '"',
+    "…": "...",
+    " ": " ",   # non-breaking space
+    "−": "-",   # minus sign
+}
+
+
 def _safe(text: Any) -> str:
     """Text the built-in fonts can actually render.
 
     `latin-1` is the core-font codepage; anything outside it raises inside fpdf
     at draw time, which would turn one Devanagari camera name into a 500 on the
-    whole report. Replace rather than fail, and keep it in ONE place so no call
-    site can forget.
+    whole report. So: transliterate what has a faithful ASCII equivalent, then
+    replace whatever genuinely cannot be represented. Kept in ONE place so no
+    call site can forget.
     """
     if text is None:
         return ""
-    return str(text).encode("latin-1", "replace").decode("latin-1")
+    s = str(text)
+    for src, dst in _TRANSLIT.items():
+        if src in s:
+            s = s.replace(src, dst)
+    return s.encode("latin-1", "replace").decode("latin-1")
 
 
 def _fmt_ts(ts: Optional[float], tz_name: str) -> str:
