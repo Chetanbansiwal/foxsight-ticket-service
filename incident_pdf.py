@@ -232,11 +232,22 @@ def build_incident_pdf(
             pdf.set_y(pdf.get_y() + draw_h + 2)
             pdf.set_font("Helvetica", "I", 8)
             pdf.set_text_color(110, 110, 110)
+            # Say "nearest to", not "recorded at".
+            #
+            # The frame returned is the closest one the recording actually
+            # contains, which is not the alarm instant: measured on the box, a
+            # 19:27:43 alarm produced a frame whose own on-screen clock read
+            # 19:27:35. Captioning that as "recorded at 19:27:43" states a time
+            # the image does not have — on a document meant to be evidence, that
+            # is the kind of detail a challenge is built on. The camera's burnt-in
+            # OSD is the authority for the frame itself, so point at it.
             pdf.multi_cell(
                 CONTENT_W, 4.5,
-                _safe(f"Frame recorded at {_fmt_ts(t.get('last_occurred_at'), tz_name)} on "
-                      f"{cam.get('name') or 'the source camera'}. Extracted from the stored "
-                      f"recording; not a re-encode of a live view."),
+                _safe(f"Nearest recorded frame to the incident at "
+                      f"{_fmt_ts(t.get('last_occurred_at'), tz_name)} on "
+                      f"{cam.get('name') or 'the source camera'}. Extracted from stored "
+                      f"footage, not re-encoded from a live view; where the camera burns in "
+                      f"its own clock, that overlay is authoritative for this frame."),
                 align="C", new_x=XPos.LMARGIN, new_y=YPos.NEXT,
             )
             pdf.set_text_color(0, 0, 0)
