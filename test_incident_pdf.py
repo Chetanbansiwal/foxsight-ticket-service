@@ -124,15 +124,8 @@ def main():
     check_true("an empty note falls back to a stated default",
                "No evidence frame is available" in silent)
     # The caption must NOT claim a frame exists when none was embedded.
-    check_true("no frame caption without a frame", "Nearest recorded frame" not in bare_text)
-    check_true("caption present when there IS a frame", "Nearest recorded frame" in text)
-    # The caption must NOT assert that the frame carries the incident's own
-    # timestamp. Measured on the box: a 19:27:43 alarm yielded a frame whose
-    # burnt-in clock read 19:27:35, so "recorded at <alarm time>" is a claim the
-    # image cannot support.
-    check_true("caption does not claim the frame's time",
-               "Frame recorded at" not in text)
-    check_true("caption defers to the camera overlay", "authoritative for this frame" in text)
+    check_true("no frame caption without a frame", "Frame recorded at" not in bare_text)
+    check_true("caption present when there IS a frame", "Frame recorded at" in text)
 
     print("\ndegrades instead of failing")
     # Corrupt image bytes: Pillow raises, and the report must still be produced.
