@@ -1275,7 +1275,12 @@ async def list_escalation_policies(
             EscalationLevel.policy_id == p.id))).scalar()
         out.append({"id": p.id, "name": p.name, "organization_id": p.organization_id, "enabled": p.enabled,
                     "match_event_types": p.match_event_types, "match_severity": p.match_severity,
-                    "match_zone_id": p.match_zone_id, "priority": p.priority, "level_count": n})
+                    "match_zone_id": p.match_zone_id, "priority": p.priority, "level_count": n,
+                    # Needed to tell whether a higher-priority policy ALWAYS
+                    # shadows a lower one. A time-scoped policy only matches
+                    # inside its window, so it cannot shadow anything outright,
+                    # and the UI must not claim it does.
+                    "active_window": p.active_window})
     return {"policies": out}
 
 
