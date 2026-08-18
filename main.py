@@ -414,11 +414,45 @@ async def _recipients_for_role(db, ticket, role_id):
 CAMERA_MANAGEMENT_URL = os.getenv("SERVICE_CAMERA_MANAGEMENT_URL", "http://camera-management:8000")
 
 
+# Longest pulse the engine will hold open itself.
+#
+# A VMS-side pulse is activate-now, release-later, and the "later" only happens
+# if this process is still alive. Keeping the ceiling low bounds how long a
+# relay can stay latched after a restart: a door strike or siren stuck on is a
+# real-world failure, not a UI annoyance. A MONOSTABLE output does not need
+# this at all — the device releases itself after its own DelayTime.
+MAX_PULSE_SECONDS = 60
+
+
+async def _release_relay_after(camera_id: int, token: str, seconds: float, ticket_id: str) -> None:
+    """Drop a relay back to inactive after `seconds`. Fire-and-forget.
+
+    Deliberately not awaited by the caller: the escalation loop must not sit
+    for the length of a pulse, and this is best-effort like the rest of the
+    response path. If the service restarts inside the window the relay stays
+    latched — which is why MAX_PULSE_SECONDS is small and the UI says so.
+    """
+    import httpx
+    try:
+        await asyncio.sleep(seconds)
+        url = f"{CAMERA_MANAGEMENT_URL}/cameras/{camera_id}/relay-outputs/{token}"
+        headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "escalation-engine"}
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            r = await client.post(url, json={"state": "inactive"}, headers=headers)
+            logger.info("relay released after pulse", ticket_id=ticket_id, camera_id=camera_id,
+                        token=token, seconds=seconds, status=r.status_code)
+    except Exception as e:
+        logger.warning("relay release failed — output may remain latched",
+                       ticket_id=ticket_id, camera_id=camera_id, token=token, error=str(e))
+
+
 async def _run_response_action(action, ticket) -> None:
     """Execute a programmed response action (WS4, clause 50.8). Best-effort —
     swallows all errors so escalation never stalls on an unreachable relay/URL.
-      - actuate_relay: params {output_token, state?} → drive the ticket camera's
-        ONVIF relay output via camera-management (service-identity headers).
+      - actuate_relay: params {output_token, state?, pulse_seconds?} → drive the
+        ticket camera's ONVIF relay output via camera-management
+        (service-identity headers). `pulse_seconds` schedules a release; omit it
+        for a monostable output, which the device releases on its own.
       - webhook:       params {url} → POST a compact ticket summary."""
     import httpx
     params = action.params or {}
@@ -428,12 +462,25 @@ async def _run_response_action(action, ticket) -> None:
             if not token or ticket.camera_id is None:
                 logger.warning("actuate_relay skipped: missing output_token or camera", ticket_id=ticket.id)
                 return
+            state = params.get("state", "active")
             url = f"{CAMERA_MANAGEMENT_URL}/cameras/{ticket.camera_id}/relay-outputs/{token}"
             headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "escalation-engine"}
             async with httpx.AsyncClient(timeout=10.0) as client:
-                r = await client.post(url, json={"state": params.get("state", "active")}, headers=headers)
+                r = await client.post(url, json={"state": state}, headers=headers)
                 logger.info("actuate_relay fired", ticket_id=ticket.id, camera_id=ticket.camera_id,
                             token=token, status=r.status_code)
+
+            # Schedule the release only for an activation that asked for one,
+            # and only when the drive itself was accepted — pulsing off a relay
+            # we failed to turn on would just be a spurious second call.
+            try:
+                pulse = float(params.get("pulse_seconds") or 0)
+            except (TypeError, ValueError):
+                pulse = 0.0
+            if pulse > 0 and state in (True, "active", "on", "activate", "1", 1) and r.status_code < 400:
+                pulse = min(pulse, MAX_PULSE_SECONDS)
+                asyncio.create_task(_release_relay_after(
+                    ticket.camera_id, token, pulse, ticket.id))
         elif action.action_type == "webhook":
             url = params.get("url")
             if not url:
