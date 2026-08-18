@@ -1651,6 +1651,16 @@ async def list_tickets(
                     "alarm_type": t.alarm_type,
                     "is_latched": t.is_latched,
                     "acknowledged_at": t.acknowledged_at,
+                    # Which policy OWNS this alarm's presentation, if any.
+                    #
+                    # The client used to raise a full-screen popup for anything
+                    # high or critical without consulting the matrix at all, so
+                    # switching the popup policy off changed nothing and there
+                    # was no way to tell from the browser whether a policy had
+                    # matched. Set by _start_escalation before the alarm is
+                    # broadcast, so it is already populated when the client
+                    # looks the ticket up.
+                    "escalation_policy_id": t.escalation_policy_id,
                     # The occurrence this ticket currently points at. Named
                     # event_id because that is what every consumer already asks
                     # for — the column is primary_event_id, and the list simply
