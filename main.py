@@ -32,6 +32,7 @@ import json
 import uuid as _uuid
 from types import SimpleNamespace
 from alarm_type_map import derive_alarm_type
+from severity_override import resolve_severity as _resolve_severity
 from auth import get_current_user_flexible, get_user_from_headers
 from zone_scoping import resolve_user_zone_ids, scope_by_camera_id
 
@@ -817,23 +818,31 @@ async def create_ticket(
 
         # Create ticket
         primary_event_id = json_data.get('primary_event_id')
+
+        # alarm_type first: the severity override is keyed on it, and analytics
+        # producers do not send one — deriving it here is what makes a
+        # per-camera override reachable for those alarms at all.
+        _alarm_type = json_data.get('alarm_type') or derive_alarm_type(json_data.get('alert_data'))
+        _severity = await _resolve_severity(
+            db, json_data.get('camera_id'), _alarm_type, json_data['severity'])
+
         ticket = Ticket(
             id=ticket_uuid,
             ticket_number=ticket_number,
             title=json_data['title'],
             description=json_data.get('description'),
-            severity=json_data['severity'],
+            severity=_severity,
             status="open",
             camera_id=json_data.get('camera_id'),
             organization_id=json_data.get('organization_id'),
             provider_id=json_data.get('provider_id'),
             vendor_alert_id=json_data.get('vendor_alert_id'),
-            # Derived when the producer omits it. The analytics path never sent
-            # alarm_type, leaving 3396 of 3550 tickets on the box untyped — so
-            # the list filter, any report by alert type, and the escalation
+            # Derived above when the producer omits it. The analytics path never
+            # sent alarm_type, leaving 3396 of 3550 tickets on the box untyped —
+            # so the list filter, any report by alert type, and the escalation
             # matrix's match_event_types all silently missed nearly every
             # analytics alarm. Whatever the caller DOES send wins.
-            alarm_type=json_data.get('alarm_type') or derive_alarm_type(json_data.get('alert_data')),
+            alarm_type=_alarm_type,
             primary_event_id=primary_event_id,
             is_latched=bool(json_data.get('is_latched', False)),
             alert_data=json_data.get('alert_data'),
@@ -1513,6 +1522,26 @@ def _wildcard_ilike_pattern(term: Optional[str]) -> Optional[str]:
     if '*' in term or '?' in term:
         return t.replace('*', '%').replace('?', '_')
     return f'%{t}%'
+
+
+@app.post("/api/tickets/severity-overrides/refresh")
+async def refresh_severity_overrides(db: AsyncSession = Depends(get_db)):
+    """Reload the per-camera severity override cache now.
+
+    event-management owns the table and force-refreshes its own cache when a
+    write comes in, but it cannot reach ours — so without this a change took up
+    to SEVERITY_CACHE_TTL_S (60s) to affect new tickets. Setting a severity and
+    watching the next alarm ignore it looks exactly like the feature not
+    working.
+
+    Unauthenticated and idempotent on purpose: it is a service-to-service nudge
+    carrying no data and revealing nothing, and making it fail closed would
+    mean a failed refresh silently reintroduces the staleness it exists to
+    remove. The TTL still heals the cache if this is never called.
+    """
+    from severity_override import load_overrides
+    held = await load_overrides(db, force=True)
+    return {"overrides": held}
 
 
 @app.post("/api/tickets/backfill-alarm-type")
