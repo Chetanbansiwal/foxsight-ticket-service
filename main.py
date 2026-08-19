@@ -29,6 +29,7 @@ from models import (
 import json
 import uuid as _uuid
 from types import SimpleNamespace
+from alarm_type_map import derive_alarm_type
 from auth import get_current_user_flexible, get_user_from_headers
 from zone_scoping import resolve_user_zone_ids, scope_by_camera_id
 
@@ -825,7 +826,12 @@ async def create_ticket(
             organization_id=json_data.get('organization_id'),
             provider_id=json_data.get('provider_id'),
             vendor_alert_id=json_data.get('vendor_alert_id'),
-            alarm_type=json_data.get('alarm_type'),
+            # Derived when the producer omits it. The analytics path never sent
+            # alarm_type, leaving 3396 of 3550 tickets on the box untyped — so
+            # the list filter, any report by alert type, and the escalation
+            # matrix's match_event_types all silently missed nearly every
+            # analytics alarm. Whatever the caller DOES send wins.
+            alarm_type=json_data.get('alarm_type') or derive_alarm_type(json_data.get('alert_data')),
             primary_event_id=primary_event_id,
             is_latched=bool(json_data.get('is_latched', False)),
             alert_data=json_data.get('alert_data'),
@@ -1505,6 +1511,60 @@ def _wildcard_ilike_pattern(term: Optional[str]) -> Optional[str]:
     if '*' in term or '?' in term:
         return t.replace('*', '%').replace('?', '_')
     return f'%{t}%'
+
+
+@app.post("/api/tickets/backfill-alarm-type")
+async def backfill_alarm_type(
+    dry_run: bool = Query(True, description="Report what would change without writing"),
+    limit: int = Query(5000, le=50000, description="Safety cap on rows examined"),
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """Fill in alarm_type on tickets the analytics producer left untyped.
+
+    Same derivation as ticket creation — imported, not re-expressed — so a
+    backfilled ticket and a newly created one classify identically. Anything
+    already typed is left alone; the producer's own value always wins.
+
+    Defaults to dry_run so the first call reports rather than writes.
+    Idempotent: re-running only touches rows that are still untyped.
+    """
+    # _is_admin is this service's idiom; PermissionChecker belongs to
+    # camera-management and is not imported here.
+    if not _is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Insufficient permissions")
+
+    rows = (await db.execute(
+        select(Ticket).where(
+            or_(Ticket.alarm_type.is_(None), Ticket.alarm_type == ""),
+            Ticket.alert_data.isnot(None),
+        ).limit(limit)
+    )).scalars().all()
+
+    counts: Dict[str, int] = {}
+    unresolved = 0
+    changed = 0
+    for t in rows:
+        derived = derive_alarm_type(t.alert_data)
+        if not derived:
+            unresolved += 1
+            continue
+        counts[derived] = counts.get(derived, 0) + 1
+        if not dry_run:
+            t.alarm_type = derived
+            changed += 1
+
+    if not dry_run and changed:
+        await db.commit()
+        logger.info("Backfilled alarm_type", changed=changed, by=counts,
+                    user_id=current_user.id)
+
+    return {
+        "examined": len(rows),
+        "would_set" if dry_run else "updated": counts,
+        "unresolved": unresolved,
+        "dry_run": dry_run,
+    }
 
 
 @app.get("/api/tickets")
