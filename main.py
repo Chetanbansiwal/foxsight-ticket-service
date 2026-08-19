@@ -878,6 +878,25 @@ async def create_ticket(
         db.add(state_history)
         await db.commit()
 
+        # Route it through the escalation matrix, exactly as /api/tickets/alarm
+        # does. Without this an alarm created here matched no policy, fired no
+        # level and notified NOBODY: no popup, no toast, no email — it simply
+        # appeared in the list. That is the path analytics-service uses
+        # (alert_to_ticket posts here, not to /alarm), so every intrusion,
+        # loitering, crowd and object-left alarm was silent, and a ticket
+        # created through the public API was silent too.
+        #
+        # _start_escalation fires level 1 SYNCHRONOUSLY, so the interruption
+        # arrives with the alarm rather than waiting up to ESCALATION_TICK_SECONDS
+        # for the scheduler to notice it.
+        #
+        # Gated on alarm_type: this endpoint also creates ordinary tickets, and
+        # a manually raised one should not page anyone. Alarms always carry a
+        # type — derived above when the producer omits it.
+        if ticket.alarm_type:
+            await _start_escalation(db, ticket)
+            await db.commit()
+
         logger.info("Ticket created",
                    ticket_id=ticket.id,
                    ticket_number=ticket_number,
