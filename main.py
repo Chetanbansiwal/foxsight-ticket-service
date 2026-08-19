@@ -10,7 +10,9 @@ import os
 from contextlib import asynccontextmanager
 from typing import List, Optional, Dict, Any
 import time as _time
-from datetime import datetime
+import datetime as _dt
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Depends, Request, Query, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, update, func, text, delete, case
@@ -1567,6 +1569,52 @@ async def backfill_alarm_type(
     }
 
 
+def _parse_range_bound(value: Optional[str], end_of_day: bool) -> Optional[float]:
+    """A date-range bound as a unix timestamp, or None if unusable.
+
+    `created_at` is a unix float, and the client sends a bare `YYYY-MM-DD`.
+    Two things this has to get right:
+
+    * **The end date is inclusive.** "to 19 Aug" plainly means through the end
+      of the 19th; treating it as midnight would hide everything raised that
+      day, so today's alarms vanish from a report that says it covers today.
+    * **Days are local days.** Boundaries are resolved in REPORT_TIMEZONE
+      (Asia/Kolkata on the box), not UTC — at +05:30 a UTC midnight cut would
+      move the boundary 5.5 hours into the previous evening and quietly drop
+      alarms an operator can see on screen.
+
+    An unparseable value returns None rather than raising: a stale saved view
+    should not 400 the whole list.
+    """
+    if not value or not str(value).strip():
+        return None
+    raw = str(value).strip()
+
+    # Already a timestamp.
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+
+    try:
+        tz = ZoneInfo(REPORT_TIMEZONE)
+    except Exception:
+        tz = timezone.utc
+
+    try:
+        if len(raw) == 10:  # YYYY-MM-DD
+            d = _dt.datetime.strptime(raw, "%Y-%m-%d")
+            d = d.replace(hour=23, minute=59, second=59, microsecond=999999) if end_of_day else d
+            return d.replace(tzinfo=tz).timestamp()
+        dt = _dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=tz)
+        return dt.timestamp()
+    except Exception:
+        logger.warning("Unparseable date bound ignored", value=raw)
+        return None
+
+
 @app.get("/api/tickets")
 async def list_tickets(
     current_user: User = Depends(get_current_user_flexible),
@@ -1579,6 +1627,8 @@ async def list_tickets(
     alarm_type: Optional[str] = Query(None, description="Filter by alarm type"),
     alarms_only: Optional[bool] = Query(None, description="Only alarm tickets (alarm_type set)"),
     search: Optional[str] = Query(None, description="Wildcard search (*, ?) over ticket #, title, description, alarm type"),
+    start_date: Optional[str] = Query(None, description="Only tickets raised on/after this date (YYYY-MM-DD, or an ISO datetime / unix seconds)"),
+    end_date: Optional[str] = Query(None, description="Only tickets raised on/before this date. A bare date is INCLUSIVE of that whole day."),
     limit: int = Query(100, le=500),
     offset: int = Query(0, ge=0),
     sort_by: Optional[str] = Query(None, description="created_at | updated_at | severity | status | camera | title | ticket_number"),
@@ -1615,6 +1665,19 @@ async def list_tickets(
             filters.append(Ticket.alarm_type == alarm_type)
         elif alarms_only:
             filters.append(Ticket.alarm_type.is_not(None))
+        # Date range. The client has always sent start_date/end_date and the
+        # server has always ignored them: the list showed an "Active filters:
+        # Date" chip while returning every ticket ever raised, and identical
+        # totals with and without the range. A filter the UI claims and the
+        # backend drops is worse than no filter — it is quietly wrong on a
+        # report someone signs.
+        _from = _parse_range_bound(start_date, end_of_day=False)
+        if _from is not None:
+            filters.append(Ticket.created_at >= _from)
+        _to = _parse_range_bound(end_date, end_of_day=True)
+        if _to is not None:
+            filters.append(Ticket.created_at <= _to)
+
         # Advanced/wildcard search (clause 44.0) over the ticket's text metadata.
         _pat = _wildcard_ilike_pattern(search)
         if _pat:
