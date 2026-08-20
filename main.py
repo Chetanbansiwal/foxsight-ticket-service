@@ -2180,6 +2180,14 @@ async def get_ticket(
             "status": ticket.status,
             "camera_id": ticket.camera_id,
             "camera_name": ticket.camera.name if ticket.camera else None,
+            # The list returns alarm_type and this did not, so anything keyed on
+            # it saw None here: the ticket detail's analytics facts rendered
+            # nothing for a crowd alarm whose own alert_data, in the same
+            # response, carried count=5. Also what the escalation matrix matches
+            # on (match_event_types), so its absence made a detail view
+            # unable to explain why a policy had fired.
+            "alarm_type": ticket.alarm_type,
+            "is_latched": ticket.is_latched,
             "provider_id": ticket.provider_id,
             "provider_name": ticket.provider.name if ticket.provider else None,
             "vendor_alert_id": ticket.vendor_alert_id,
