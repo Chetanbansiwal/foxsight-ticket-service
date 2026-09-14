@@ -31,6 +31,7 @@ CASES = [
     ("object left (19 on box)", vm("roi_entry", "abandoned_object"), "object_left"),
     ("object removed (16 on box)", vm("roi_entry", "removed_object"), "object_removed"),
     ("line crossing", vm("line_crossed", "person"), "line_crossed"),
+    ("vehicle pass from a sequence rule", vm("sequence_complete", "car"), "vehicle_pass"),
     ("tamper", vm("tamper"), "camera_tamper"),
 
     # Nothing to go on -> None, never a guess. A mislabelled alarm corrupts both

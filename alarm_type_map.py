@@ -43,6 +43,8 @@ _BY_EVENT_TYPE = {
     "crowd_detected": "crowd_gathering",
     "line_crossed": "line_crossed",
     "line_crossing": "line_crossed",
+    # An ordered pass (line A, then line B) from a track_sequence rule set to raise alerts.
+    "sequence_complete": "vehicle_pass",
     "region_exit": "region_exit",
     "tamper": "camera_tamper",
     "scene_change": "scene_change",
