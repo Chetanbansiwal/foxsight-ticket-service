@@ -31,7 +31,11 @@ CASES = [
     ("object left (19 on box)", vm("roi_entry", "abandoned_object"), "object_left"),
     ("object removed (16 on box)", vm("roi_entry", "removed_object"), "object_removed"),
     ("line crossing", vm("line_crossed", "person"), "line_crossed"),
-    ("vehicle pass from a sequence rule", vm("sequence_complete", "car"), "vehicle_pass"),
+    # A rule that names its type wins; a sequence event alone says nothing about meaning.
+    ("rule-named type", vm("track_enriched", "person", alarm_type="no_helmet"), "no_helmet"),
+    ("rule-named type beats derivation", vm("roi_entry", "person", alarm_type="restricted_area"), "restricted_area"),
+    ("malformed named type falls back", vm("roi_entry", "person", alarm_type="No Helmet!"), "intrusion"),
+    ("sequence pass, no named type", vm("sequence_complete", "car"), None),
     ("tamper", vm("tamper"), "camera_tamper"),
 
     # Nothing to go on -> None, never a guess. A mislabelled alarm corrupts both

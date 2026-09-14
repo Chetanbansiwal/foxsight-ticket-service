@@ -24,10 +24,25 @@ unattended-object rules (1057 + 35 tickets on the box). What separates them is
 "left" from "removed", something the ticket title never did (it says
 "Object left/removed in zone" for both).
 
-Every value produced here is one that ALREADY exists in the vocabulary on the
+Every value derived here is one that ALREADY exists in the vocabulary on the
 box, so this classifies into the established set rather than inventing names.
+
+One exception, and it is not a derivation: a rule can NAME the type of its
+tickets (`alert_config.alarm_type`, carried as `vendor_metadata.alarm_type`).
+That is a typed field the rule's author chose and analytics-service validated —
+not the rule's display name the notes above rule out — and it is the only way
+for rules whose meaning is their own: a track_sequence event says only that a
+sequence completed, whether the rule watches for vehicles passing or a person
+without a helmet. Guessing a type from that event (it was briefly
+`vehicle_pass`) would mislabel every other use.
 """
+import re
 from typing import Any, Dict, Optional
+
+# Same rule analytics-service applies when the type is saved; re-checked here so
+# a malformed value from any producer falls back to derivation instead of
+# landing in a VARCHAR(50) column the escalation matrix matches on.
+_NAMED_TYPE = re.compile(r"^[a-z][a-z0-9_]{1,49}$")
 
 # object_class -> alarm_type, for event types where the class is what
 # distinguishes one alarm from another.
@@ -43,8 +58,6 @@ _BY_EVENT_TYPE = {
     "crowd_detected": "crowd_gathering",
     "line_crossed": "line_crossed",
     "line_crossing": "line_crossed",
-    # An ordered pass (line A, then line B) from a track_sequence rule set to raise alerts.
-    "sequence_complete": "vehicle_pass",
     "region_exit": "region_exit",
     "tamper": "camera_tamper",
     "scene_change": "scene_change",
@@ -84,6 +97,11 @@ def derive_alarm_type(alert_data: Optional[Dict[str, Any]]) -> Optional[str]:
     """
     if not isinstance(alert_data, dict):
         return None
+
+    vm = alert_data.get("vendor_metadata")
+    named = vm.get("alarm_type") if isinstance(vm, dict) else None
+    if isinstance(named, str) and _NAMED_TYPE.match(named):
+        return named
 
     event_type = _first_event_type(alert_data)
     if not event_type:
