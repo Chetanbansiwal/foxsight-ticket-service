@@ -1863,7 +1863,7 @@ async def list_tickets(
                     "assigned_to": t.assigned_to.username if t.assigned_to else None,
                     "created_at": t.created_at if t.created_at else None,
                     "updated_at": t.updated_at if t.updated_at else None,
-                    "thumbnail_url": t.thumbnail_url,
+                    "thumbnail_url": _thumbnail_url(t),
                     "sla_breach": t.sla_breach,
                     # WS3 alarm surface: latched-alarm rendering + type filter.
                     "alarm_type": t.alarm_type,
@@ -2080,7 +2080,7 @@ RECORDING_SERVICE_URL = os.getenv("SERVICE_RECORDING_SERVICE_URL", "http://recor
 REPORT_TIMEZONE = os.getenv("REPORT_TIMEZONE", "UTC")
 
 
-async def _evidence_frame(ticket_id: str, camera_id, when_unix):
+async def _evidence_frame(ticket_id: str, camera_id, when_unix, width=None):
     """(jpeg_bytes, note). Never raises — a missing frame must not cost the
     report, but the reason IS carried through so the document can say why the
     picture is absent instead of showing an empty box."""
@@ -2093,7 +2093,10 @@ async def _evidence_frame(ticket_id: str, camera_id, when_unix):
     headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "incident-report"}
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
-            r = await client.get(url, params={"t": float(when_unix)}, headers=headers)
+            params = {"t": float(when_unix)}
+            if width:
+                params["width"] = int(width)
+            r = await client.get(url, params=params, headers=headers)
         if r.status_code == 200 and r.content:
             return r.content, ""
         detail = r.text[:180] if r.text else ""
@@ -2106,6 +2109,125 @@ async def _evidence_frame(ticket_id: str, camera_id, when_unix):
         logger.warning("Evidence frame fetch failed", ticket_id=ticket_id, error=str(e))
         return None, (f"The evidence frame could not be retrieved ({type(e).__name__}). "
                       "The recording may still exist — retry from the ticket.")
+
+
+
+
+# ---------------------------------------------------------------------------
+# The alarm's picture.
+#
+# Derived from the footage at the alarm's own instant rather than captured when
+# the alarm fires. Three things follow, and the third is the reason:
+#
+#   * every ticket ALREADY in the system gets one — capturing at alarm time
+#     would only ever help tickets raised afterwards, and this box had 40
+#     tickets and 0 thumbnails;
+#   * nothing new has to be stored, so nothing new has to be swept, quota'd or
+#     backed up: the truth stays in the recording;
+#   * it is available immediately. The recording is within about five seconds
+#     of real time, while the 15-second evidence clip an operator opens today
+#     takes far longer to assemble — so this is what fills the gap between an
+#     alarm appearing and its video being watchable.
+# ---------------------------------------------------------------------------
+
+THUMBNAIL_TTL_SECONDS = int(os.getenv("TICKET_THUMBNAIL_TTL", str(24 * 3600)))
+THUMBNAIL_MAX_WIDTH = 1280
+
+# Extracting a frame costs an ffmpeg process on a box whose day job is writing
+# video. A page of fifty alarms would ask for fifty at once, so the client only
+# requests what is on screen — and this makes that a property of the server
+# rather than a promise from the client, because the next client will be
+# someone's script.
+THUMBNAIL_CONCURRENCY = int(os.getenv("TICKET_THUMBNAIL_CONCURRENCY", "2"))
+_thumbnail_slots = asyncio.Semaphore(THUMBNAIL_CONCURRENCY)
+
+
+@app.get("/api/tickets/{ticket_id}/thumbnail")
+async def get_ticket_thumbnail(
+    ticket_id: str,
+    width: int = 320,
+    current_user: User = Depends(get_current_user_flexible),
+    db: AsyncSession = Depends(get_db),
+):
+    """The evidence still for one ticket, scaled, cached.
+
+    Cached in Redis and not in the database: it is derived data with a known
+    source, so losing the cache costs one ffmpeg run rather than a picture. The
+    cache is what makes a fifty-row alarm list affordable — without it, drawing
+    one page would start fifty ffmpeg processes on a box that is also
+    recording.
+    """
+    width = max(64, min(int(width or 320), THUMBNAIL_MAX_WIDTH))
+    # Zone scoping the same way every other read here does it: narrow the
+    # query rather than fetch and then check. A ticket outside the caller's
+    # zones is simply not found, which is also the honest answer — whether it
+    # exists is itself something a zone grant decides.
+    zone_ids = await resolve_user_zone_ids(current_user, db)
+    query = scope_by_camera_id(select(Ticket).where(Ticket.id == ticket_id), Ticket, zone_ids)
+    ticket = (await db.execute(query)).scalar_one_or_none()
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+
+    when = ticket.last_occurred_at or ticket.created_at
+    cache_key = f"ticket:thumb:{ticket_id}:{width}"
+
+    redis = None
+    try:
+        redis = await get_redis()
+        cached = await redis.get(cache_key)
+        if cached:
+            return Response(content=cached, media_type="image/jpeg",
+                            headers={"Cache-Control": "private, max-age=3600",
+                                     "X-Thumbnail-Source": "cache"})
+    except Exception as e:  # noqa: BLE001
+        logger.debug("thumbnail cache unavailable", error=str(e))
+
+    async with _thumbnail_slots:
+        # Re-check inside the queue: while waiting for a slot, another request
+        # for the same ticket may have finished and cached it. Without this, a
+        # list of identical rows still pays for every one of them.
+        if redis is not None:
+            try:
+                cached = await redis.get(cache_key)
+                if cached:
+                    return Response(content=cached, media_type="image/jpeg",
+                                    headers={"Cache-Control": "private, max-age=3600",
+                                             "X-Thumbnail-Source": "cache"})
+            except Exception:  # noqa: BLE001
+                pass
+        jpeg, note = await _evidence_frame(ticket_id, ticket.camera_id, when, width=width)
+
+    if not jpeg:
+        # A reason rather than a broken image: "no footage covers this moment"
+        # is something an operator can act on, and a 404 with an empty body is
+        # not.
+        raise HTTPException(status_code=404, detail=note or "No evidence frame for this ticket")
+
+    if redis is not None:
+        try:
+            await redis.setex(cache_key, THUMBNAIL_TTL_SECONDS, jpeg)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("thumbnail not cached", error=str(e))
+
+    return Response(content=jpeg, media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=3600",
+                             "X-Thumbnail-Source": "footage"})
+
+
+def _thumbnail_url(ticket) -> Optional[str]:
+    """What the UI should show for this ticket.
+
+    A stored thumbnail wins: analytics providers and the ANPR module attach a
+    real image of the detection, which is better evidence than a frame pulled
+    from the timeline. Everything else — motion, camera offline, anything
+    promoted from an event — gets the derived one, which is why an alarm list
+    that was blank now has pictures in it.
+    """
+    if ticket.thumbnail_url:
+        return ticket.thumbnail_url
+    if ticket.camera_id and (ticket.last_occurred_at or ticket.created_at):
+        return f"/api/tickets/{ticket.id}/thumbnail"
+    return None
 
 
 @app.get("/api/tickets/{ticket_id}/report.pdf")
@@ -2194,7 +2316,7 @@ async def get_ticket(
             "assigned_to": ticket.assigned_to.username if ticket.assigned_to else None,
             "assigned_at": ticket.assigned_at if ticket.assigned_at else None,
             "alert_data": ticket.alert_data,
-            "thumbnail_url": ticket.thumbnail_url,
+            "thumbnail_url": _thumbnail_url(ticket),
             "video_clip_url": ticket.video_clip_url,
             "detection_count": ticket.detection_count,
             "sla_breach": ticket.sla_breach,
