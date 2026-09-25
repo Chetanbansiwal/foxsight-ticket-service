@@ -101,6 +101,19 @@ async def _ensure_escalation_schema():
                     ADD COLUMN IF NOT EXISTS acknowledged_by      INTEGER
             """))
             await s.execute(text("CREATE INDEX IF NOT EXISTS ix_tickets_next_escalation_at ON tickets(next_escalation_at)"))
+            # The two narrower scopes. A policy could only ever be written at
+            # zone or organisation level, so "this one camera" meant giving the
+            # camera a zone of its own, and a centre could not say "site A
+            # escalates to A's DCP" at all.
+            await s.execute(text("""
+                ALTER TABLE escalation_policies
+                    ADD COLUMN IF NOT EXISTS match_camera_id INTEGER,
+                    ADD COLUMN IF NOT EXISTS match_site_id   VARCHAR(64)
+            """))
+            await s.execute(text("CREATE INDEX IF NOT EXISTS ix_escalation_policies_match_camera_id "
+                                 "ON escalation_policies(match_camera_id)"))
+            await s.execute(text("CREATE INDEX IF NOT EXISTS ix_escalation_policies_match_site_id "
+                                 "ON escalation_policies(match_site_id)"))
         logger.info("WS1 escalation schema ensured (self-migration)")
     except Exception as e:
         logger.warning("Escalation self-migration skipped/failed", error=str(e))
@@ -266,23 +279,57 @@ async def _ensure_default_policies():
         logger.warning("Default policy seed skipped/failed", error=str(e))
 
 
+# This box's own site id, or "" on a t1 install that has no fleet identity. The
+# same id enrolment issued, which the relay routes by and the outbox partitions
+# on — one id, not a fourth namespace.
+SITE_ID = os.getenv("VMS_RELAY_INSTANCE_ID", "")
+
+# How narrow a policy is, used only to break a tie between policies of equal
+# priority. Explicit priority still wins outright: an operator who set one meant
+# it. But two policies at the default priority — "all cameras" and "this one
+# camera" — have to be separated by something, and the answer anybody would
+# expect from writing a per-camera policy is that it beats the general one.
+def _specificity(p) -> int:
+    if p.match_camera_id is not None:
+        return 3
+    if p.match_zone_id:
+        return 2
+    if p.match_site_id:
+        return 1
+    return 0
+
+
 async def _match_policy(db, ticket):
-    """Best enabled escalation policy for a ticket: org (or NULL-org) ∧ event-type
-    ∧ min-severity ∧ zone-subtree. Highest priority wins."""
+    """Best enabled escalation policy for a ticket.
+
+    A policy may be written at any of four levels, and they are filters rather
+    than modes: organisation, site, zone (that zone and its descendants) and
+    camera, with NULL meaning "any" at each. Highest priority wins, and among
+    equal priorities the narrowest does.
+    """
     q = select(EscalationPolicy).where(
         EscalationPolicy.enabled == True,
         or_(EscalationPolicy.organization_id == ticket.organization_id,
             EscalationPolicy.organization_id.is_(None)),
-    ).order_by(EscalationPolicy.priority.desc())
+    )
     policies = (await db.execute(q)).scalars().all()
     if not policies:
         return None
+    policies = sorted(policies, key=lambda p: (p.priority or 0, _specificity(p)), reverse=True)
     alarm_path = await _alarm_zone_path(db, ticket)
     tsev = _SEV_RANK.get((ticket.severity or "").lower(), 0)
     for p in policies:
         if p.match_event_types and (ticket.alarm_type or "") not in p.match_event_types:
             continue
         if p.match_severity and tsev < _SEV_RANK.get(p.match_severity.lower(), 0):
+            continue
+        # Camera: the narrowest scope, and the only one that needs no lookup.
+        if p.match_camera_id is not None and ticket.camera_id != p.match_camera_id:
+            continue
+        # Site: matches only where it names this box. A policy authored at a
+        # centre for another site travels here and stays inert, which is what
+        # lets the same policy set be distributed everywhere.
+        if p.match_site_id and p.match_site_id != SITE_ID:
             continue
         if p.match_zone_id:
             pzpath = (await db.execute(select(Zone.path).where(Zone.id == p.match_zone_id))).scalar_one_or_none()
@@ -1120,7 +1167,9 @@ def _serialize_policy(p, levels, recips_by_level, actions_by_level) -> Dict[str,
     return {
         "id": p.id, "name": p.name, "organization_id": p.organization_id, "enabled": p.enabled,
         "match_event_types": p.match_event_types, "match_severity": p.match_severity,
-        "match_zone_id": p.match_zone_id, "active_window": p.active_window, "priority": p.priority,
+        "match_zone_id": p.match_zone_id, "match_camera_id": p.match_camera_id,
+        "match_site_id": p.match_site_id,
+        "active_window": p.active_window, "priority": p.priority,
         "levels": [{
             "id": l.id, "level_no": l.level_no, "wait_seconds": l.wait_seconds, "stop_on_ack": l.stop_on_ack,
             "recipients": [{"id": r.id, "recipient_type": r.recipient_type, "role_id": r.role_id,
@@ -1358,7 +1407,9 @@ async def list_escalation_policies(
             EscalationLevel.policy_id == p.id))).scalar()
         out.append({"id": p.id, "name": p.name, "organization_id": p.organization_id, "enabled": p.enabled,
                     "match_event_types": p.match_event_types, "match_severity": p.match_severity,
-                    "match_zone_id": p.match_zone_id, "priority": p.priority, "level_count": n,
+                    "match_zone_id": p.match_zone_id, "match_camera_id": p.match_camera_id,
+                    "match_site_id": p.match_site_id,
+                    "priority": p.priority, "level_count": n,
                     # Needed to tell whether a higher-priority policy ALWAYS
                     # shadows a lower one. A time-scoped policy only matches
                     # inside its window, so it cannot shadow anything outright,
@@ -1397,6 +1448,7 @@ async def create_escalation_policy(
             id=pid, name=data["name"], organization_id=data.get("organization_id"),
             enabled=bool(data.get("enabled", True)), match_event_types=data.get("match_event_types"),
             match_severity=data.get("match_severity"), match_zone_id=data.get("match_zone_id"),
+            match_camera_id=data.get("match_camera_id"), match_site_id=data.get("match_site_id"),
             active_window=data.get("active_window"), priority=int(data.get("priority", 0)),
             created_at=now, updated_at=now))
         await _write_levels(db, pid, data.get("levels", []))
@@ -1425,7 +1477,7 @@ async def update_escalation_policy(
             raise HTTPException(status_code=404, detail="Policy not found")
         data = await request.json()
         for f in ("name", "organization_id", "enabled", "match_event_types", "match_severity",
-                  "match_zone_id", "active_window", "priority"):
+                  "match_zone_id", "match_camera_id", "match_site_id", "active_window", "priority"):
             if f in data:
                 setattr(p, f, data[f])
         p.updated_at = _time.time()
