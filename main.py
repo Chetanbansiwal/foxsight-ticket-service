@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, or_, update, func, text, delete, case
 from sqlalchemy.orm import selectinload
 import structlog
+import gateway_assertion
 
 # Import shared modules - using installed vms-shared package
 from database import db_manager, get_db, get_db_session, get_redis
@@ -487,7 +488,7 @@ async def _release_relay_after(camera_id: int, token: str, seconds: float, ticke
     try:
         await asyncio.sleep(seconds)
         url = f"{CAMERA_MANAGEMENT_URL}/cameras/{camera_id}/relay-outputs/{token}"
-        headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "escalation-engine"}
+        headers = gateway_assertion.identity_headers("0", "administrator", "escalation-engine")
         async with httpx.AsyncClient(timeout=10.0) as client:
             r = await client.post(url, json={"state": "inactive"}, headers=headers)
             logger.info("relay released after pulse", ticket_id=ticket_id, camera_id=camera_id,
@@ -515,7 +516,7 @@ async def _run_response_action(action, ticket) -> None:
                 return
             state = params.get("state", "active")
             url = f"{CAMERA_MANAGEMENT_URL}/cameras/{ticket.camera_id}/relay-outputs/{token}"
-            headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "escalation-engine"}
+            headers = gateway_assertion.identity_headers("0", "administrator", "escalation-engine")
             async with httpx.AsyncClient(timeout=10.0) as client:
                 r = await client.post(url, json={"state": state}, headers=headers)
                 logger.info("actuate_relay fired", ticket_id=ticket.id, camera_id=ticket.camera_id,
@@ -2142,7 +2143,7 @@ async def _evidence_frame(ticket_id: str, camera_id, when_unix, width=None):
         return None, "The incident carries no occurrence time, so no frame could be located."
     import httpx
     url = f"{RECORDING_SERVICE_URL}/playback/{camera_id}/frame-at"
-    headers = {"X-User-ID": "0", "X-User-Role": "administrator", "X-User-Name": "incident-report"}
+    headers = gateway_assertion.identity_headers("0", "administrator", "incident-report")
     try:
         async with httpx.AsyncClient(timeout=25.0) as client:
             params = {"t": float(when_unix)}
