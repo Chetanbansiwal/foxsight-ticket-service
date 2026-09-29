@@ -1225,7 +1225,10 @@ async def list_org_roles(
     """List the configurable role hierarchy (for the escalation matrix builder)."""
     q = select(OrgRole)
     if organization_id:
-        q = q.where(or_(OrgRole.organization_id == organization_id, OrgRole.organization_id.is_(None)))
+        # The `organization_id IS NULL` half of this was a template-role
+        # fallback; Stage 1 made the column NOT NULL, so it is now a branch that
+        # can never match. RLS scopes the query regardless.
+        q = q.where(OrgRole.organization_id == organization_id)
     roles = (await db.execute(q.order_by(OrgRole.rank))).scalars().all()
     return {"roles": [{"id": r.id, "name": r.name, "display_name": r.display_name, "rank": r.rank,
                        "is_system": r.is_system, "organization_id": r.organization_id} for r in roles]}
@@ -1253,11 +1256,23 @@ async def upsert_sla_policy(request: Request, current_user: User = Depends(get_c
     sev = (data.get("severity") or "").lower().strip()
     if sev not in ("low", "medium", "high", "critical"):
         raise HTTPException(status_code=400, detail="severity must be low|medium|high|critical")
-    org = data.get("organization_id")
     now = _time.time()
+    # Scope comes from the caller, never from the request body.
+    #
+    # This used to look up `organization_id == org if org else
+    # organization_id IS NULL`, taking `org` from the JSON the client sent.
+    # After Stage 1 no row has a NULL tenant, so a request that omitted the
+    # field matched nothing, fell through to an INSERT, and hit
+    # uq_sla_org_severity — a hard 500 on an ordinary update. Measured: 500
+    # without the field, 200 with it.
+    #
+    # The fix is not to restore the NULL branch. Row-level security already
+    # scopes this SELECT to the caller's organisation and the insert trigger
+    # stamps it, so severity alone identifies the row — and a client can no
+    # longer aim a write at an organisation by naming it in a body, which is
+    # §6 Stage 2's "derive scope from the subject, not a header".
     existing = (await db.execute(select(SLAPolicy).where(
         SLAPolicy.severity == sev,
-        SLAPolicy.organization_id == org if org else SLAPolicy.organization_id.is_(None),
     ))).scalars().first()
     if existing:
         existing.ack_seconds = data.get("ack_seconds")
