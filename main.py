@@ -246,7 +246,47 @@ _DEFAULT_POLICIES = [
 
 
 async def _ensure_default_policies():
-    """Create any missing catch-all policy. Idempotent by name."""
+    """Create any missing catch-all policy, in EVERY organisation. Idempotent by name.
+
+    Once per organisation, pinned to it: escalation policies are row-secured, so
+    an unpinned seed gave only the default organisation its catch-alls, and a
+    second organisation's alarms matched no policy and never escalated.
+    """
+    from database import organisation_ids, as_tenant
+    try:
+        orgs = await organisation_ids()
+    except Exception as e:
+        logger.warning("Default policy seed skipped: cannot list organisations", error=str(e))
+        return
+    for org in orgs:
+        with as_tenant(org):
+            await _ensure_default_policies_for_current()
+
+
+async def _org_seed_loop():
+    """Seed an organisation created while this service is running.
+
+    T3 provisioning creates a unit's organisation from its licence; nothing
+    restarts this service when it does. A minute's pass notices a new
+    organisation and seeds it; the seed is idempotent, so a repeat is harmless.
+    """
+    from database import organisation_ids
+    seen = None
+    while True:
+        await asyncio.sleep(60)
+        try:
+            orgs = set(await organisation_ids())
+            if orgs != seen:
+                await _ensure_default_policies()
+                seen = orgs
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Organisation seed pass failed", error=str(e))
+
+
+async def _ensure_default_policies_for_current():
+    """The catch-all policies for the organisation this task is pinned to."""
     try:
         async with db_manager.get_session() as db:
             names = [s["name"] for s in _DEFAULT_POLICIES]
@@ -803,17 +843,20 @@ async def lifespan(app: FastAPI):
     escalation_task = asyncio.create_task(_escalation_scheduler_loop())
     # WS6: SLA-breach detector.
     sla_task = asyncio.create_task(_sla_breach_loop())
+    # Organisations created later (T3 provisioning) get their catch-alls too.
+    org_seed_task = asyncio.create_task(_org_seed_loop())
     logger.info("Ticket Service started successfully")
 
     yield
 
     # Shutdown
     logger.info("Shutting down Ticket Service...")
-    escalation_task.cancel()
-    try:
-        await escalation_task
-    except (asyncio.CancelledError, Exception):
-        pass
+    for task in (escalation_task, sla_task, org_seed_task):
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
     await db_manager.cleanup()
     logger.info("Ticket Service shutdown complete")
 
