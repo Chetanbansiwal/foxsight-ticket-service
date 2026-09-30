@@ -992,6 +992,20 @@ async def upsert_alarm(
             raise HTTPException(status_code=400, detail="alarm_type and event_id are required")
         camera_id = data.get('camera_id')
         is_clear = bool(data.get('is_clear', False))
+        # A T3 unit's alarm names its organisation (event-management forwards it
+        # from the cloud VMS, which took it from t3_units). File the ticket
+        # there — and only if the camera is that organisation's, so no call can
+        # put a ticket into another tenant for a camera it does not own. The
+        # session opened before this line, so the tenant is re-applied to its
+        # transaction. Absent for local alarms, which are unchanged.
+        if data.get('organization_id'):
+            from database import set_current_tenant, _pin_tenant
+            set_current_tenant(data['organization_id'])
+            await _pin_tenant(db)
+            if camera_id is not None and not (await db.execute(
+                    text("SELECT 1 FROM cameras WHERE id = :c"), {"c": camera_id})).first():
+                raise HTTPException(status_code=404,
+                                    detail="camera is not in the named organisation")
         now = _time.time()
         actor = caller.id if caller else 1
 
