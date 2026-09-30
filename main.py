@@ -670,39 +670,57 @@ async def _start_escalation(db, ticket):
 
 
 async def _escalation_scheduler_loop():
-    """Advance unacknowledged tickets to their next level when due (~ESCALATION_TICK_SECONDS)."""
+    """Advance unacknowledged tickets to their next level when due (~ESCALATION_TICK_SECONDS).
+
+    Once per organisation, pinned to it: unpinned, the loop saw only the
+    default organisation and no other organisation's ticket ever escalated.
+    """
+    from database import organisation_ids, as_tenant
     await asyncio.sleep(10)  # let startup settle
     while True:
         try:
-            now = _time.time()
-            async with db_manager.get_session() as db:
-                due = (await db.execute(select(Ticket).where(
-                    Ticket.next_escalation_at.is_not(None),
-                    Ticket.next_escalation_at <= now,
-                    Ticket.acknowledged_at.is_(None),
-                    Ticket.status.in_(("open", "assigned", "in_progress")),
-                ))).scalars().all()
-                for ticket in due:
-                    levels = sorted(
-                        (await db.execute(select(EscalationLevel).where(
-                            EscalationLevel.policy_id == ticket.escalation_policy_id))).scalars().all(),
-                        key=lambda l: l.level_no)
-                    cur = next((i for i, l in enumerate(levels) if l.level_no == ticket.escalation_level), -1)
-                    nxt = levels[cur + 1] if 0 <= cur < len(levels) - 1 else None
-                    if not nxt:
-                        ticket.next_escalation_at = None
-                        continue
-                    ticket.escalation_level = nxt.level_no
-                    ticket.escalated_at = now
-                    await _fire_level(db, ticket, nxt, now)
-                    after = levels[cur + 2] if cur + 2 < len(levels) else None
-                    ticket.next_escalation_at = (now + (after.wait_seconds or 0)) if after else None
-                await db.commit()
+            orgs = await organisation_ids()
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("Escalation scheduler error", error=str(e))
+            logger.warning("Escalation scheduler: cannot list organisations", error=str(e))
+            orgs = []
+        for org in orgs:
+            with as_tenant(org):
+                try:
+                    await _escalation_tick(_time.time())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("Escalation scheduler error", organization=org, error=str(e))
         await asyncio.sleep(ESCALATION_TICK_SECONDS)
+
+
+async def _escalation_tick(now: float):
+    """One organisation's due escalations — the caller has pinned it."""
+    async with db_manager.get_session() as db:
+        due = (await db.execute(select(Ticket).where(
+            Ticket.next_escalation_at.is_not(None),
+            Ticket.next_escalation_at <= now,
+            Ticket.acknowledged_at.is_(None),
+            Ticket.status.in_(("open", "assigned", "in_progress")),
+        ))).scalars().all()
+        for ticket in due:
+            levels = sorted(
+                (await db.execute(select(EscalationLevel).where(
+                    EscalationLevel.policy_id == ticket.escalation_policy_id))).scalars().all(),
+                key=lambda l: l.level_no)
+            cur = next((i for i, l in enumerate(levels) if l.level_no == ticket.escalation_level), -1)
+            nxt = levels[cur + 1] if 0 <= cur < len(levels) - 1 else None
+            if not nxt:
+                ticket.next_escalation_at = None
+                continue
+            ticket.escalation_level = nxt.level_no
+            ticket.escalated_at = now
+            await _fire_level(db, ticket, nxt, now)
+            after = levels[cur + 2] if cur + 2 < len(levels) else None
+            ticket.next_escalation_at = (now + (after.wait_seconds or 0)) if after else None
+        await db.commit()
 
 
 SLA_TICK_SECONDS = int(os.getenv("SLA_TICK_SECONDS", "60"))
@@ -713,48 +731,63 @@ async def _sla_breach_loop():
     not-yet-breached ticket whose severity has an SLAPolicy (org-specific, else
     the NULL-org default), set sla_breach when it exceeds the resolve deadline,
     or the ack deadline while still unacknowledged. Bounded batch per tick."""
+    from database import organisation_ids, as_tenant
     await asyncio.sleep(20)
     while True:
         try:
-            now = _time.time()
-            async with db_manager.get_session() as db:
-                policies = (await db.execute(select(SLAPolicy))).scalars().all()
-                if policies:
-                    bysev = {}
-                    for p in policies:
-                        bysev[(p.organization_id, (p.severity or "").lower())] = p
-                    # Scope to alarm/incident tickets (alarm_type set) — SLA is an
-                    # incident-response deadline, not something to hang on every
-                    # analytics detection; this also bounds the scan.
-                    tickets = (await db.execute(select(Ticket).where(
-                        Ticket.status.in_(("open", "assigned", "in_progress")),
-                        Ticket.sla_breach.isnot(True),
-                        Ticket.alarm_type.isnot(None),
-                    ).order_by(Ticket.created_at.desc()).limit(500))).scalars().all()
-                    changed = 0
-                    for t in tickets:
-                        sev = (t.severity or "").lower()
-                        pol = bysev.get((t.organization_id, sev)) or bysev.get((None, sev))
-                        if not pol:
-                            continue
-                        age = now - (t.created_at or now)
-                        reason = None
-                        if pol.resolve_seconds and age > pol.resolve_seconds:
-                            reason = f"Resolution SLA breached (> {pol.resolve_seconds}s)"
-                        elif pol.ack_seconds and not t.acknowledged_at and age > pol.ack_seconds:
-                            reason = f"Acknowledgement SLA breached (> {pol.ack_seconds}s)"
-                        if reason:
-                            t.sla_breach = True
-                            t.sla_breach_reason = reason
-                            changed += 1
-                    if changed:
-                        await db.commit()
-                        logger.info("SLA breaches flagged", count=changed)
+            orgs = await organisation_ids()
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            logger.warning("SLA breach loop error", error=str(e))
+            logger.warning("SLA breach loop: cannot list organisations", error=str(e))
+            orgs = []
+        # Once per organisation, pinned to it (see _escalation_scheduler_loop).
+        for org in orgs:
+            with as_tenant(org):
+                try:
+                    await _sla_breach_tick(_time.time())
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning("SLA breach loop error", organization=org, error=str(e))
         await asyncio.sleep(SLA_TICK_SECONDS)
+
+
+async def _sla_breach_tick(now: float):
+    """One organisation's SLA breaches — the caller has pinned it."""
+    async with db_manager.get_session() as db:
+        policies = (await db.execute(select(SLAPolicy))).scalars().all()
+        if policies:
+            bysev = {}
+            for p in policies:
+                bysev[(p.organization_id, (p.severity or "").lower())] = p
+            # Scope to alarm/incident tickets (alarm_type set) — SLA is an
+            # incident-response deadline, not something to hang on every
+            # analytics detection; this also bounds the scan.
+            tickets = (await db.execute(select(Ticket).where(
+                Ticket.status.in_(("open", "assigned", "in_progress")),
+                Ticket.sla_breach.isnot(True),
+                Ticket.alarm_type.isnot(None),
+            ).order_by(Ticket.created_at.desc()).limit(500))).scalars().all()
+            changed = 0
+            for t in tickets:
+                sev = (t.severity or "").lower()
+                pol = bysev.get((t.organization_id, sev)) or bysev.get((None, sev))
+                if not pol:
+                    continue
+                age = now - (t.created_at or now)
+                reason = None
+                if pol.resolve_seconds and age > pol.resolve_seconds:
+                    reason = f"Resolution SLA breached (> {pol.resolve_seconds}s)"
+                elif pol.ack_seconds and not t.acknowledged_at and age > pol.ack_seconds:
+                    reason = f"Acknowledgement SLA breached (> {pol.ack_seconds}s)"
+                if reason:
+                    t.sla_breach = True
+                    t.sla_breach_reason = reason
+                    changed += 1
+            if changed:
+                await db.commit()
+                logger.info("SLA breaches flagged", count=changed)
 
 
 @asynccontextmanager
@@ -1294,7 +1327,10 @@ async def upsert_sla_policy(request: Request, current_user: User = Depends(get_c
         existing.updated_at = now
         p = existing
     else:
-        p = SLAPolicy(id=str(_uuid.uuid4()), organization_id=org, severity=sev,
+        # organization_id left unset: the insert trigger stamps the pinned
+        # organisation (a platform admin's act-as included). It named a variable
+        # the fix above removed, so every NEW policy was a NameError 500.
+        p = SLAPolicy(id=str(_uuid.uuid4()), organization_id=None, severity=sev,
                       ack_seconds=data.get("ack_seconds"), resolve_seconds=data.get("resolve_seconds"),
                       created_at=now, updated_at=now)
         db.add(p)
